@@ -1,0 +1,61 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# This test reproduces CUM-2464. It will cause an umount failure
+# with EBUSY in unexport. The unexport will fail on nuvo without
+# the umount retry.
+
+TEST_NAME="umount_ebusy"
+
+NUVO_FUNC_TEST_VALGRIND=false
+
+# setup the cluster - a small cluster with small devices for example.
+source ./fake_cluster $1
+num_servers=1
+devices_per_server=1
+size_of_device=2G
+size_of_parcel=536870912
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+# now create a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID 10737418240
+VOL_UUID=${VOL_UUIDS[0]}
+
+# add parcels to the volume
+fake_cluster_grow_volume_percent $VOL_UUID 100
+
+sleep 1 
+
+NUM_LOOP=250
+
+for (( i=1; i<${NUM_LOOP}; i++ ));
+do
+    fake_cluster_export_active $VOL_UUID
+
+    # Attempt a mount with non-existent mount point
+    NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+    set +e
+    mount $NUVOVOL /this/does/not/exist
+    set -e
+
+    # This unexport will fail sometimes because
+    # the umount it issues returns EBUSY
+    fake_cluster_unexport_active $VOL_UUID
+done
+
+# cluster tear-down is handled in finish

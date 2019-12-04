@@ -1,0 +1,121 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="PIT MUTABILITY"
+
+if [ "$#" -ne 1 ] ; then
+    echo "pit_mutability nuvo_vm_cmd"
+    exit 1
+fi
+
+NUVO_VM=$1
+
+size_of_parcel=$(expr 256 \* 1024 \* 1024)
+size_of_device=$(expr 1024 \* 1024 \* 1024)
+
+# setup the cluster
+source ./fake_cluster $NUVO_VM
+fake_cluster_create 1 1 $size_of_device $size_of_parcel
+
+lun_size=$(expr  120 \* 1024 \* 1024 )
+
+# now create and use a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID $lun_size
+VOL_UUID=${VOL_UUIDS[0]}
+
+fake_cluster_grow_volume_percent $VOL_UUID 100
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+
+declare -a PIT_UUID
+declare -a PIT_SEEDS
+
+function create_test_pit() {
+    local pit_i=$1
+    PIT_SEEDS[$pit_i]=$RANDOM
+    fio --name=test --verify=crc32c --rw=randwrite --size=100K --io_size=20K --ioengine=libaio --iodepth=1 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed ${PIT_SEEDS[$pit_i]}
+    bno=$(expr $pit_i \+ 25 )
+    dd if=/dev/urandom of=$NUVOVOL seek=$bno count=1 conv=notrunc bs=4096 oflag=direct
+    sync
+    PIT_UUID[$pit_i]=$( uuidgen )
+    fake_cluster_pause_io $VOL_UUID
+    fake_cluster_create_pit $VOL_UUID ${PIT_UUID[$pit_i]}
+    fake_cluster_resume_io $VOL_UUID
+    fake_cluster_export_pit $VOL_UUID ${PIT_UUID[$pit_i]}
+    local pit_name=$(fake_cluster_pit_path ${PIT_UUID[$pit_i]})
+    md5sum -b $pit_name >> /tmp/md5_${PIT_UUID[$pit_i]}
+    cp $pit_name /tmp/lun_${PIT_UUID[$pit_i]}
+    fake_cluster_unexport_pit ${PIT_UUID[$pit_i]}
+    fake_cluster_export_pit $VOL_UUID ${PIT_UUID[$pit_i]}
+    md5sum -c /tmp/md5_${PIT_UUID[$pit_i]}
+    fake_cluster_unexport_pit ${PIT_UUID[$pit_i]}
+}
+
+function check_test_pit() {
+    local pit_id=$1
+    fake_cluster_export_pit $VOL_UUID ${PIT_UUID[$pit_id]}
+    local pit_name=$(fake_cluster_pit_path ${PIT_UUID[$pit_id]})
+    cmp $pit_name /tmp/lun_${PIT_UUID[$pit_id]}
+    md5sum -c /tmp/md5_${PIT_UUID[$pit_id]}
+    fio --name=test --verify_only --verify=crc32c --rw=randread --size=100K --io_size=20K --ioengine=libaio --iodepth=1 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$pit_name --randseed ${PIT_SEEDS[$pit_id]}
+    fake_cluster_unexport_pit ${PIT_UUID[$pit_id]}
+}
+
+#dd if=/dev/urandom of=$NUVOVOL seek=0 count=5 conv=notrunc bs=4096 oflag=direct
+NUM_PITS=3
+for i in $(seq 1 $NUM_PITS) ; do
+    create_test_pit $i
+done
+
+fake_cluster_unexport_active $VOL_UUID
+fake_cluster_close_vol $VOL_UUID
+fake_cluster_open_vol $VOL_UUID
+fake_cluster_export_active $VOL_UUID
+for i in $(seq 1 $NUM_PITS) ; do
+    check_test_pit $i
+done
+
+num_iters=10
+
+pit_to_replace=0
+
+for i in $(seq -f "%05g" 1 $num_iters) ; do
+    # One of these rotates 1, 2, 3 ... the other does random
+    #pit_to_replace=$(expr $(expr $pit_to_replace % $NUM_PITS ) + 1)
+    pit_to_replace=$(expr 1 + $RANDOM % $NUM_PITS)
+
+    check_test_pit $pit_to_replace
+    fake_cluster_delete_pit $VOL_UUID ${PIT_UUID[$pit_to_replace]}
+    create_test_pit $pit_to_replace
+    fake_cluster_list_pits $VOL_UUID
+done
+
+fake_cluster_unexport_active $VOL_UUID
+fake_cluster_close_vol $VOL_UUID
+fake_cluster_open_vol $VOL_UUID
+fake_cluster_export_active $VOL_UUID
+for i in $(seq 1 $NUM_PITS) ; do
+    check_test_pit $i
+done
+# cluster tear-down is handled in finish

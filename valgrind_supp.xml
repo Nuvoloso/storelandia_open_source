@@ -1,0 +1,28 @@
+{
+   <Suppress leak in test no free 1>
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   fun:no_free1
+   fun:tcase_run_tfun_nofork.isra.9
+   fun:srunner_run
+   fun:main
+}
+{
+   <Suppress leak in test no free 2>
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   fun:no_free2
+   fun:tcase_run_tfun_nofork.isra.9
+   fun:srunner_run
+   fun:main
+}
+
+{
+   <Suppress backtrace valgrind>
+   Memcheck:Param
+   msync(start)
+   obj:/lib/x86_64-linux-gnu/libpthread-2.24.so
+   obj:/usr/lib/x86_64-linux-gnu/libunwind.so.8.0.1
+}

@@ -1,0 +1,3 @@
+SET(CTEST_CUSTOM_MEMCHECK_IGNORE
+  ${CTEST_CUSTOM_MEMCHECK_IGNORE}
+  nuvo_unit_tests_no_valgrind )

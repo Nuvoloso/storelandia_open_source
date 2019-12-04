@@ -1,0 +1,138 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="SEQUENTIAL SPACE 2"
+
+if [ "$#" -ne 6 ] ; then
+    echo "sequential_space nuvo_vm_cmd num_devices num_parcels parcel_size percent_used percent_to_write"
+    echo "USAGE: num_devices is number of devices"
+    echo "USAGE: num_parcels is parcels per device"
+    echo "USAGE: parcel_size is in MB"
+    echo "USAGE: percent used is lun size as percentage of parcel space"
+    echo "USAGE: percent_to_write percent to of allocated size to write"
+    exit 1
+fi
+
+NUVO_VM=$1
+PARAM_NUM_DEVICES=$2
+PARAM_NUM_PARCELS=$3
+PARAM_PARCEL_SIZE=$4
+PARAM_PERCENT_USED=$5
+PARAM_PERCENT_TO_WRITE=$6
+
+size_of_parcel=$(expr $PARAM_PARCEL_SIZE \* 1024 \* 1024)
+size_of_device=$(expr $PARAM_NUM_PARCELS \* $size_of_parcel + 16 \* 1024 \* 1024)
+
+# setup the cluster
+source ./fake_cluster $NUVO_VM
+fake_cluster_create 1 $PARAM_NUM_DEVICES $size_of_device $size_of_parcel
+
+# Start with have space allocated.
+allocated_space_mb=$(expr $PARAM_NUM_DEVICES \* $PARAM_NUM_PARCELS \* $PARAM_PARCEL_SIZE)
+lun_size=$(expr $allocated_space_mb \* $PARAM_PERCENT_USED / 100 \* 1024 \* 1024 )
+io_size=$(expr $lun_size \* 9 / 10)
+
+# now create and use a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID $lun_size
+VOL_UUID=${VOL_UUIDS[0]}
+LOGFILE=/tmp/func_test_nuvo_output_${NODE_UUID[$VOL_SERVER]}.txt
+fake_cluster_log_level 1 space 25
+
+# start with 50% space, so we can run out and then add parcels.
+fake_cluster_grow_volume_percent $VOL_UUID 50
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+fake_cluster_vol_mkfs $VOL_UUID
+fake_cluster_mount_lun $VOL_UUID
+FIO_FILE=${LUN_MOUNT_POINT[$VOL_UUID]}/fio_file
+df ${LUN_MOUNT_POINT[$VOL_UUID]}
+
+total_data=$(expr $allocated_space_mb \* $PARAM_PERCENT_TO_WRITE / 100)
+
+log_lines=$(cat $LOGFILE | wc -l)
+
+fio --name=test --rw=write --size=$io_size --io_size=$io_size --ioengine=libaio --iodepth=1 --bs=128K --direct=1 --numjobs=1 --unlink=0 --filename=$FIO_FILE --randseed $RANDOM&
+FIO_PID=$!
+
+# Wait to run out of space
+( tail -f -n +$log_lines $LOGFILE & ) | grep -q "Pausing client write"
+fake_cluster_vol_manifest $VOL_UUID seq_space_manifest_short_0.png true
+
+log_lines=$(cat $LOGFILE | wc -l)
+fake_cluster_grow_volume_percent $VOL_UUID 100
+( tail -f -n +$log_lines $LOGFILE & ) | grep -q "Unpausing client write"
+wait $FIO_PID
+
+# take pit
+PITUUID=`uuidgen`
+fake_cluster_pause_io $VOL_UUID
+cat /proc/meminfo
+fsfreeze -f ${LUN_MOUNT_POINT[$VOL_UUID]}
+fake_cluster_create_pit $VOL_UUID $PITUUID
+fake_cluster_resume_io $VOL_UUID
+fsfreeze -u ${LUN_MOUNT_POINT[$VOL_UUID]}
+
+fake_cluster_vol_manifest $VOL_UUID seq_space_manifest_short_0a.png true
+
+log_lines=$(cat $LOGFILE | wc -l)
+# write more.  Do this in background since this should stall out of space.
+fio --name=test --rw=write --size=$io_size --io_size=$io_size --ioengine=libaio --iodepth=1 --bs=128K --direct=1 --numjobs=1 --unlink=0 --filename=$FIO_FILE --randseed $RANDOM &
+FIO_PID=$!
+
+# wait for suspended io to appear in log
+( tail -f -n +$log_lines $LOGFILE & ) | grep -q "Pausing client write"
+
+fake_cluster_vol_manifest $VOL_UUID seq_space_manifest_short_1.png true
+sleep 5
+fake_cluster_vol_manifest $VOL_UUID seq_space_manifest_short_2.png true
+
+# take another pit - this should open up reserve and allow the fsfreeze writes
+log_lines=$(cat $LOGFILE | wc -l)
+PITUUID2=`uuidgen`
+fake_cluster_pause_io $VOL_UUID
+cat /proc/meminfo
+fsfreeze -f ${LUN_MOUNT_POINT[$VOL_UUID]}
+fake_cluster_create_pit $VOL_UUID $PITUUID2
+fake_cluster_resume_io $VOL_UUID
+fsfreeze -u ${LUN_MOUNT_POINT[$VOL_UUID]}
+
+fake_cluster_vol_manifest $VOL_UUID seq_space_manifest_short_3.png true
+sleep 5
+fake_cluster_vol_manifest $VOL_UUID seq_space_manifest_short_4.png true
+
+fake_cluster_export_pit $VOL_UUID $PITUUID
+# Can uncomment next line if you interactively want to wait.
+# prompt "then press Enter here to do delete"
+# this allows one to play around with having the pit exported.
+fake_cluster_unexport_pit $PITUUID
+
+#delete pit
+fake_cluster_delete_pit $VOL_UUID $PITUUID
+( tail -f -n +$log_lines $LOGFILE & ) | grep -q "Unpausing client write"
+
+fake_cluster_delete_pit $VOL_UUID $PITUUID2
+#wait for drainage.
+wait $FIO_PID
+fake_cluster_vol_manifest $VOL_UUID seq_space_manifest_short_5.png true
+
+# cluster tear-down is handled in finish

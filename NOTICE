@@ -1,0 +1,7 @@
+Copyright Tad Lebeck
+Apache 2.0 License
+
+This product contains code developed at Nuvoloso Systems.
+The exceptions are libs/khash (licensed under MIT license) and
+libs/xxhash (BSD 2-Clause License) - see notices within those
+source files in accordance with those licenses.

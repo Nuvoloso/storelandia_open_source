@@ -1,0 +1,891 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+echo "------------------------------------------------"
+echo "STARTING $TEST_NAME TEST"
+echo "INITIALIZING FAKE CLUSTER"
+echo "------------------------------------------------"
+
+set -x
+set -e
+set -u
+
+prompt() {
+    echo -n $*
+    read resp
+}
+
+# Pass in the nuvo command
+if [ "$#" -eq 0 ] ; then
+  echo "USAGE: `basename $0` <nuvo_vm location>"
+  exit 1
+fi
+NUVO_VM_FT_CMD=$1
+
+# Point to the NUVO_CMD in this tree.
+BUILD_DIR=${2:-"../../../"}
+NUVO_CMD=$BUILD_DIR"nuvo/nuvo"
+NUVO_CMD_PERF=$BUILD_DIR"nuvo/nuvo_gperftools"
+EPHEM_CMD=$BUILD_DIR"util/nuvo_ephemeral"
+NUVO_FUNC_TEST_TOOL=${NUVO_FUNC_TEST_TOOL:-default}
+DUMP_LOG_FILES=${DUMP_LOG_FILES:-0}
+
+# Create a directory
+TEST_DIR=`mktemp -d /tmp/nuvo_test.XXXXXXXXXXXXXXXX`
+echo "Created test directory $TEST_DIR"
+
+# Will identify servers with directories. Then keep the
+# key variables in associative arrays keyed by the directory
+NUVO_DIRS=()
+declare -A FUSE_PID
+declare -A FUSE_DIR
+declare -A NODE_UUID
+declare -A NODE_PORT
+declare -A NODE_CTRL
+
+# Keep "devices" keyed by device UUID
+DEV_UUIDS=()
+declare -A DEV_PATH
+declare -A DEV_NODE
+declare -A DEV_SERVER
+declare -A DEV_NUM_PARCELS
+
+# Volumes keyed by device UUID
+VOL_UUIDS=()
+declare -A VOL_ROOT_DEV_UUID
+declare -A VOL_ROOT_PARCEL_UUID
+declare -A VOL_SERVER
+
+# Exported LUNs
+declare -A LUN_VOL_UUID
+declare -A LUN_NAME
+declare -A PIT_VOL_UUID
+declare -A PIT_NAME
+declare -A LUN_MOUNT_POINT
+
+function fake_cluster_finish()
+{
+    local lc="$BASH_COMMAND" rc=$?
+    set +e
+    set +x
+    set +u
+    echo "-----------------------------------------"
+    echo "Cluster teardown"
+    echo "-----------------------------------------"
+    fake_cluster_nuvo_log 1 "unmount all luns"
+    fake_cluster_umount_all_luns
+    fake_cluster_unexport_pit_all
+    fake_cluster_unexport_active_all
+    fake_cluster_close_all_volumes
+    fake_cluster_tear_down
+    if [ $rc -eq 0 ]; then
+        lc="$NUVO_CMD or tool"
+        rc=$NUVO_EXIT_STATUS
+    fi
+    if [ $rc -eq 0 ]; then
+        echo "-----------------------------------------"
+        echo "Finished $TEST_NAME TEST"
+        echo SUCCESS
+        echo "-----------------------------------------"
+    else
+        if [ $DUMP_LOG_FILES -eq 1 ]; then
+            echo "------------------------------------------"
+            echo "$TEST_NAME FAILED, dumping logs to console"
+            echo "------------------------------------------"
+            for d in ${NUVO_DIRS[*]}
+            do
+                cat /tmp/func_test_nuvo_output_${NODE_UUID[$d]}.txt
+            done
+        fi
+        echo "-----------------------------------------"
+        echo "Finished $TEST_NAME TEST"
+        echo FAILED
+        echo COMMAND [$lc]
+        echo EXITED WITH CODE [$rc]
+        echo "-----------------------------------------"
+    fi
+    rm -rf $TEST_DIR
+    exit $rc
+}
+trap fake_cluster_finish EXIT
+
+#to do nuvo log, call fake_cluster_nuvo_log <node_id> <string to log>
+
+function fake_cluster_nuvo_log() {
+    fake_cluster_debug_trigger $1 --trigger "log_marker" --device "$2"
+}
+
+function fake_cluster_failed() {
+    echo "-----------------------------------------"
+    echo "DECLARING FAILURE"
+    echo "ERROR - $1"
+    echo "-----------------------------------------"
+    exit 1
+}
+
+function fake_cluster_tear_down() {
+    echo "Tearing down fake cluster"
+    # Volumes should be unmounted.
+
+    NUVO_EXIT_STATUS=0
+    for d in ${NUVO_DIRS[*]}
+    do
+        fake_cluster_halt $d
+        wait ${FUSE_PID[$d]}
+        nuvo_tool_status=$?
+        echo "Nuvo log at /tmp/func_test_nuvo_output_${NODE_UUID[$d]}.txt"
+        if [ $nuvo_tool_status -eq 0 ]; then
+            if [ "$NUVO_FUNC_TEST_TOOL" = "callgrind" ]; then
+                echo "Callgrind file at /tmp/callgrind.out.${FUSE_PID[$d]}"
+                mv callgrind.out.${FUSE_PID[$d]} /tmp
+            fi
+            if [ "$NUVO_FUNC_TEST_TOOL" = "profile" ]; then
+                echo "Profile file at /tmp/profile_${NODE_UUID[$d]}"
+            fi
+            echo "$NUVO_CMD (and tool) exited cleanly"
+        else
+            if [ $NUVO_EXIT_STATUS -eq 0 ]; then
+                NUVO_EXIT_STATUS=$nuvo_tool_status
+            fi
+        fi
+    done
+    rm -rf $TEST_DIR
+}
+
+# Configure a node - do not start the process.
+# $1 working directory
+# This will create a mnt directory.
+# Within a directory we will build:
+#    $1/fuse     - the directory luns appear in
+#    $1/nuvo_socket - the control socket
+# As devices are added they will also go into the directory
+function fake_cluster_configure_node() {
+    local server_dir=$1
+
+    # Create FUSE directory
+    FUSE_DIR[$server_dir]=$server_dir/fuse
+    mkdir -p ${FUSE_DIR[$server_dir]}
+    NODE_CTRL[$server_dir]=$server_dir/nuvo_ctrl
+    NODE_UUID[$server_dir]=$( uuidgen )
+    # Get an ephemeral port left in TIME_WAIT state soe
+    # we can pass it into the fuse process and know we
+    # are not having collisions
+    NODE_PORT[$server_dir]=$( $EPHEM_CMD )
+
+    NUVO_DIRS+=($server_dir)
+}
+
+# Set the node uuid after a reboot if you intentionally skipped that step.
+# Can be used after fake_cluster_launch_node if use_node is set to false.
+# $1 working directory
+function fake_cluster_set_node_uuid() {
+    local server_dir=$1
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v use-node-uuid -u ${NODE_UUID[$server_dir]}
+}
+
+# Set or clear the node init done flag.  Kontroller will set this once a node
+# is done with it's original configuration.  Clearing is used for testing only.
+# $1 working directory
+# $2 value to set the flag (true/false)
+function fake_cluster_set_node_init_done() {
+    local server_dir=$1
+    local is_done=${2:-true}
+    local opt_param=""
+
+    if [ "$is_done" = false ] ; then
+        opt_param="-c"
+    fi
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v node-init-done -n ${NODE_UUID[$server_dir]} $opt_param
+}
+
+# Launch a nuvo process
+# $1 working directory
+# $2 whether to do use_node.
+function fake_cluster_launch_node() {
+    local server_dir=$1
+    local use_node=${2:-true}
+
+    # Start up the volume manager
+    echo "Starting nuvo process in $server_dir"
+
+    if [ "$NUVO_FUNC_TEST_TOOL" = "valgrind" ]; then
+        valgrind --error-exitcode=1 --leak-check=full --num-callers=20\
+            --trace-children=yes --track-origins=yes --gen-suppressions=all\
+            --suppressions=valgrind_supp.xml\
+            $NUVO_CMD -f ${FUSE_DIR[$server_dir]} socket=${NODE_CTRL[$server_dir]}\
+            port=${NODE_PORT[$server_dir]} &>> /tmp/func_test_nuvo_output_${NODE_UUID[$server_dir]}.txt&
+        FUSE_PID[$server_dir]=$!
+        echo "nuvo process started under valgrind"
+    elif [ "$NUVO_FUNC_TEST_TOOL" = "callgrind" ]; then
+        valgrind --tool=callgrind $NUVO_CMD -f ${FUSE_DIR[$server_dir]} socket=${NODE_CTRL[$server_dir]}\
+            port=${NODE_PORT[$server_dir]} &>> /tmp/func_test_nuvo_output_${NODE_UUID[$server_dir]}.txt&
+        FUSE_PID[$server_dir]=$!
+        echo "nuvo process started under callgrind"
+        echo "callgrind file will be left at /tmp/callgrind.out.${FUSE_PID[$server_dir]}"
+     elif [ "$NUVO_FUNC_TEST_TOOL" = "profile" ]; then
+         perf_file=/tmp/profile_${NODE_UUID[$server_dir]}
+         env CPUPROFILE=$perf_file $NUVO_CMD_PERF -f ${FUSE_DIR[$server_dir]} socket=${NODE_CTRL[$server_dir]}\
+            port=${NODE_PORT[$server_dir]} &>> /tmp/func_test_nuvo_output_${NODE_UUID[$server_dir]}.txt &
+         FUSE_PID[$server_dir]=$!
+         echo "nuvo process started for gperftool, perf file: $perf_file"
+    elif [ "$NUVO_FUNC_TEST_TOOL" = "gdb" ]; then
+        $NUVO_CMD -f ${FUSE_DIR[$server_dir]} socket=${NODE_CTRL[$server_dir]}\
+            port=${NODE_PORT[$server_dir]} &>> /tmp/func_test_nuvo_output_${NODE_UUID[$server_dir]}.txt&
+        FUSE_PID[$server_dir]=$!
+        sleep 1
+        set +x
+        echo "nuvo process ${FUSE_PID[$server_dir]} waiting for gdb.  Do this:"
+        echo "    sudo gdb build/Debug/nuvo/nuvo"
+        echo "    attach ${FUSE_PID[$server_dir]}"
+        echo "    frame 2"
+        echo "    set done=1"
+        echo "    continue"
+        prompt "then press Enter here."
+        set -x
+    else
+        $NUVO_CMD -f ${FUSE_DIR[$server_dir]} socket=${NODE_CTRL[$server_dir]}\
+            port=${NODE_PORT[$server_dir]} &>> /tmp/func_test_nuvo_output_${NODE_UUID[$server_dir]}.txt&
+        FUSE_PID[$server_dir]=$!
+        echo "nuvo process started boring style"
+    fi
+
+    echo "nuvo process output redirected to /tmp/func_test_nuvo_output_${NODE_UUID[$server_dir]}.txt"
+
+    for i in {1..30}
+    do
+          if [ -e ${NODE_CTRL[$server_dir]} ]; then
+              break
+          fi
+          echo "Waiting for socket"
+        sleep 1
+    done
+
+    if [ ! -e ${NODE_CTRL[$server_dir]} ]; then
+        fake_cluster_failed "Socket never came up"
+    fi
+
+    if [ $use_node = true ] ; then
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v use-node-uuid -u ${NODE_UUID[$server_dir]}
+    fi
+}
+
+
+function fake_cluster_reboot_node() {
+    local server_dir=$1
+    local use_node=${2:-true}
+
+    kill -KILL ${FUSE_PID[$server_dir]}
+    set +e
+    wait ${FUSE_PID[$server_dir]}
+    set -e
+    rm ${NODE_CTRL[$server_dir]}
+    fake_cluster_launch_node $server_dir $use_node
+}
+
+function fake_cluster_reinit_node() {
+    local server_dir=$1
+    # use local devices
+    for uuid in ${DEV_UUIDS[@]}
+    do
+        if [ ${DEV_SERVER[$uuid]} == $server_dir ]; then
+            fake_cluster_use_device $uuid
+        fi
+    done
+
+    fake_cluster_node_other_node_locations $server_dir
+    fake_cluster_node_device_locations $server_dir
+}
+
+function fake_cluster_reboot_cluster() {
+    local kill="${1:-true}"
+    for node in ${NUVO_DIRS[*]}
+    do
+        if [ "$kill" = true ]; then
+            kill -KILL ${FUSE_PID[$node]}
+        fi
+        set +e
+        wait ${FUSE_PID[$node]}
+        set -e
+        echo $node
+        rm ${NODE_CTRL[$node]}
+    done
+    for node in ${NUVO_DIRS[*]}
+    do
+        fake_cluster_launch_node $node
+    done
+    for node in ${NUVO_DIRS[*]}
+    do
+        fake_cluster_reinit_node $node
+    done
+}
+
+# $1 - number of nodes
+function fake_cluster_create_nodes() {
+    for i in $(seq 1 $1)
+    do
+        local server_dir=$TEST_DIR/$i
+        fake_cluster_configure_node $server_dir
+        fake_cluster_launch_node $server_dir
+    done
+}
+
+# Add a device to node and format it
+# $1 - Node name
+# $2 - Device name
+# $3 - UUID
+# $4 - Device size (e.g. 512M or 10G)
+# $5 - parcel size in bytes
+function fake_cluster_format_device() {
+    local server_dir=$1
+    local name=$2
+    local uuid=$3
+    local size=$4
+    local parcel_size=$5
+
+    DEV_UUIDS+=($uuid)
+    DEV_NODE[$uuid]=${NODE_UUID[$server_dir]}
+    echo ${DEV_NODE[$uuid]}
+    DEV_SERVER[$uuid]=$server_dir
+    DEV_PATH[$uuid]=$server_dir/$name
+    truncate -s $size ${DEV_PATH[$uuid]}
+    echo "        Created disk" ${DEV_NODE[$uuid]} ${DEV_PATH[$uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v format-device -p $parcel_size -d ${DEV_PATH[$uuid]} -u=$uuid
+    let DEV_NUM_PARCELS[$uuid]=($(stat --printf="%s" ${DEV_PATH[$uuid]})-1024000)/$parcel_size
+}
+
+# Use device on the node it it located on
+# $1 - UUID
+function fake_cluster_use_device() {
+    local uuid=$1
+    local server_dir=${DEV_SERVER[$uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v use-device -d ${DEV_PATH[$uuid]} -u=$uuid
+}
+
+# Format and use a bunch of devices on a node
+# $1 - Node name
+# $2 - Number of devices
+# $3 - Device size (e.g. 512M or 10G)
+# $4 - parcel size in bytes
+function fake_cluster_format_and_use_devices() {
+    local server_dir=$1
+    local num=$2
+    local size=$3
+    local parcel_size=$4
+    for i in $(seq 1 $num)
+    do
+        device_name=disk$i
+        local uuid=$( uuidgen )
+        fake_cluster_format_device $server_dir $device_name $uuid $size $parcel_size
+        fake_cluster_use_device $uuid
+    done
+}
+
+# Use device on the node it it located on
+# $1 - UUID
+function fake_cluster_close_device() {
+    local uuid=$1
+    local server_dir=${DEV_SERVER[$uuid]}
+    out=$($NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v close-device -u=$uuid)
+    echo "Close device result: $out\n"
+}
+
+# Tell a node about another node
+# $1 - the node to tell
+# $2 - the node to tell it about
+function fake_cluster_node_location() {
+    local d1=$1
+    local d2=$2
+    if [ $d1 != $d2 ] ; then
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$d1]} -v node-location -n ${NODE_UUID[$d2]} -i "127.0.0.1" -p ${NODE_PORT[$d2]}
+    fi
+}
+
+# Tell a node about all node locations
+function fake_cluster_node_other_node_locations() {
+    local server=$1
+    for node in ${NUVO_DIRS[@]}
+    do
+        fake_cluster_node_location $server $node
+    done
+}
+
+# Tell a node what node another device is on
+# $1 - the node to tell
+# $2 - the device_uuid
+function fake_cluster_node_device_location() {
+    local server_dir=$1
+    local device_uuid=$2
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v device-location -d $device_uuid -n ${DEV_NODE[$device_uuid]}
+}
+
+function fake_cluster_node_device_locations() {
+    local server_dir=$1
+    for uuid in ${DEV_UUIDS[@]}
+    do
+        fake_cluster_node_device_location $server_dir $uuid
+    done
+}
+
+# Add a cache device to a node
+# $1 - Node name
+# $2 - Device name
+# $3 - UUID
+# $4 - Device size (e.g. 512M or 10G)
+function fake_cluster_use_cache_device() {
+    local server_dir=$1
+    local uuid=$2
+    local size=$3
+
+    name="cachedev.$2"
+
+    DEV_NODE[$uuid]=${NODE_UUID[$server_dir]}
+    echo ${DEV_NODE[$uuid]}
+    CDEV_PATH=$server_dir/$name
+    truncate -s $size ${CDEV_PATH}
+    #use-cache-device returns two values in the result to be parsed by the caller.
+    out=$($NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v use-cache-device -d ${CDEV_PATH} -u=$uuid | cut -d: -f 6 | xargs)
+    echo "        Created cache device ${DEV_NODE[$uuid]} ${CDEV_PATH} result: $out"
+}
+
+# Allocate all space on device to given volume
+# Can use this for a volume with devices on a remote (not local) node
+function fake_cluster_alloc_cache_to_volume() {
+    local vol_uuid=$1
+    local size=$2
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} alloc-cache -v $vol_uuid -s $size
+}
+
+function fake_cluster_get_device_stats() {
+    local server_dir=$1
+    local uuid=$2
+
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v get-stats -r -p -d ${uuid}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v get-stats -w -p -d ${uuid}
+}
+
+function fake_cluster_get_vol_stats() {
+    local server_dir=$1
+    local uuid=$2
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} -v get-vol-stats -v ${uuid}
+}
+
+# Create a quick and dirty cluster with no special bells and whistles.
+# No volumes
+# $1 - number of nodes
+# $2 - number of devices per node
+# $3 - size of devices (e.g. 512M, 10G)
+# $4 - parcel sizes
+function fake_cluster_create() {
+    local num_servers=$1
+    local num_devices=$2
+    local device_size=$3
+    local parcel_size=$4
+    fake_cluster_create_nodes $num_servers
+    for node in ${NUVO_DIRS[@]}
+    do
+        fake_cluster_format_and_use_devices $node $num_devices $device_size $parcel_size
+    done
+    for node in ${NUVO_DIRS[@]}
+    do
+        fake_cluster_node_other_node_locations $node
+    done
+    for node in ${NUVO_DIRS[@]}
+    do
+        fake_cluster_node_device_locations $node
+    done
+}
+
+# create a volume
+# $1 - server to create it on
+# $2 - uuid of device to hold it
+# $3 - Size of the volume.
+# $4 - Optional to pass in volume uuid.
+function fake_cluster_create_vol() {
+    local server=$1
+    local dev_uuid=$2
+    local size=$3
+    local vol_uuid=${4:-$( uuidgen )}
+    local parcel_uuid=$( uuidgen )
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server]} create-volume -d $dev_uuid -v $vol_uuid -p $parcel_uuid -s $size
+    VOL_ROOT_DEV_UUID[$vol_uuid]=$dev_uuid
+    VOL_ROOT_PARCEL_UUID[$vol_uuid]=$parcel_uuid
+    VOL_SERVER[$vol_uuid]+=$server
+    VOL_UUIDS+=($vol_uuid)
+}
+
+# destroy a volume
+# $1 - vol_uuid to destroy
+function fake_cluster_destroy_vol() {
+    local vol_uuid=$1
+    local should_fail=${2:-false}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    local dev_uuid=${VOL_ROOT_DEV_UUID[$vol_uuid]}
+    local parcel_uuid=${VOL_ROOT_PARCEL_UUID[$vol_uuid]}
+    if [ "$should_fail" = false ] ; then
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} destroy-volume -d $dev_uuid -v $vol_uuid -p $parcel_uuid
+        unset VOL_ROOT_DEV_UUID[$vol_uuid]
+        unset VOL_ROOT_PARCEL_UUID[$vol_uuid]
+        unset VOL_SERVER[$vol_uuid]
+        for i in "${!VOL_UUIDS[@]}"; do
+            if [[ ${VOL_UUIDS[i]} = $vol_uuid ]]; then
+                unset 'VOL_UUIDS[i]'
+            fi
+        done
+    elif ($NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} destroy-volume -d $dev_uuid -v $vol_uuid -p $parcel_uuid) ;  then
+        fake_cluster_failed $should_fail
+    fi
+}
+
+# Export the active lun
+# $1 - vol_uuid
+function fake_cluster_export_active() {
+    local vol_uuid=$1
+    local lun_uuid=$1
+    local name=$1
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} export -v $vol_uuid -e $name
+    LUN_VOL_UUID[$lun_uuid]=$vol_uuid
+    LUN_NAME[$lun_uuid]=$name
+}
+
+function fake_cluster_unexport_active() {
+    local vol_uuid=$1
+    local lun_uuid=$1
+    local name=${LUN_NAME[$lun_uuid]}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} unexport -v $vol_uuid -e $name
+    unset LUN_VOL_UUID[$lun_uuid]
+    unset LUN_NAME[$lun_uuid]
+}
+
+# Export a pit using the pit as export name if none is supplied
+# $1 - vol_uuid
+# $2 - pit_uuid
+# $3 - optional name for the export.
+function fake_cluster_export_pit() {
+    local vol_uuid=$1
+    local pit_uuid=$2
+    local name=${3:-$2}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} export -v $vol_uuid -e $name -p $pit_uuid -r
+    PIT_VOL_UUID[$pit_uuid]=$vol_uuid
+    PIT_NAME[$pit_uuid]=$name
+}
+
+# Unexport a pit
+# $1 - pit_uuid
+function fake_cluster_unexport_pit() {
+    local pit_uuid=$1
+    local name=${PIT_NAME[$pit_uuid]}
+    local vol_uuid=${PIT_VOL_UUID[$pit_uuid]}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} unexport -v $vol_uuid -e $name -p $pit_uuid
+    unset PIT_VOL_UUID[$pit_uuid]
+    unset PIT_NAME[$pit_uuid]
+}
+
+function fake_cluster_unexport_active_all() {
+    echo "Unexporting all luns"
+
+    local lun_uuids=${!LUN_VOL_UUID[@]}
+    for lun_uuid in $lun_uuids
+    do
+        fake_cluster_unexport_active $lun_uuid
+    done
+}
+
+function fake_cluster_unexport_pit_all() {
+    echo "Unexporting all pits"
+    for p in ${!PIT_VOL_UUID[@]}
+    do
+        fake_cluster_unexport_pit $p
+    done
+}
+
+# grow volume to rough percentage of total space on device
+# Will grow proportionally to each device, rounded down.
+function fake_cluster_grow_volume_device_percent() {
+    local vol_uuid=$1
+    local dev_uuid=$2
+    local percent=$3
+    local num_parcels
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    let num_parcels=(DEV_NUM_PARCELS[$dev_uuid]*percent)/100
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} alloc-parcels -v $vol_uuid -d $dev_uuid -n $num_parcels
+
+}
+
+# grow volume to rough percentage of total space.
+# Will grow proportionally to each device, rounded down.
+function fake_cluster_grow_volume_percent() {
+    local vol_uuid=$1
+    local percent=$2
+    for dev_uuid in ${DEV_UUIDS[*]}
+    do
+        fake_cluster_grow_volume_device_percent $vol_uuid $dev_uuid $percent
+    done
+}
+
+# Allocate all space on device to given volume
+# Can use this for a volume with devices on a remote (not local) node
+function fake_cluster_grow_volume_on_device() {
+    local vol_uuid=$1
+    local dev_uuid=$2
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    local num_parcels=${DEV_NUM_PARCELS[$dev_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} alloc-parcels -v $vol_uuid -d $dev_uuid -n $num_parcels
+}
+
+# close volume
+# $1 - vol_uuid
+function fake_cluster_close_vol() {
+    local vol_uuid=$1
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} close-volume -v $vol_uuid
+}
+
+function fake_cluster_close_all_volumes() {
+    echo "Closing volumes"
+    for vol in ${VOL_UUIDS[@]}
+    do
+        fake_cluster_close_vol $vol
+    done
+}
+
+# open volume
+# $1 - vol_uuid
+function fake_cluster_open_vol() {
+    local vol_uuid=$1
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    local root_dev=${VOL_ROOT_DEV_UUID[$vol_uuid]}
+    local root_parcel=${VOL_ROOT_PARCEL_UUID[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} open-volume -d $root_dev -v $vol_uuid -p $root_parcel
+}
+
+function fake_cluster_vol_manifest() {
+    local vol_uuid=$1
+    local file_name=$2
+    local short_version=${3:-false}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    if [ "$short_version" = true ] ; then
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} manifest -v $vol_uuid -f $file_name -s
+    else
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} manifest -v $vol_uuid -f $file_name
+    fi
+}
+
+# this echoes out the path to the lun.  This allows you to
+# path=$(fake_cluster_active_path $lun_uuid)
+# to get the path
+function fake_cluster_active_path() {
+    local lun_uuid=$1
+    local vol_uuid=${LUN_VOL_UUID[$lun_uuid]}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    echo "${FUSE_DIR[$vol_server]}/$lun_uuid/vol"
+}
+
+# this echoes out the path to a pit lun.  This allows you to
+# path=$(fake_cluster_pit_path $lun_uuid)
+# to get the path
+function fake_cluster_pit_path() {
+    local lun_uuid=$1
+    local vol_uuid=${PIT_VOL_UUID[$lun_uuid]}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    echo "${FUSE_DIR[$vol_server]}/${PIT_NAME[$lun_uuid]}/vol"
+}
+
+function fake_cluster_vol_mkfs() {
+    local lun_uuid=$1
+    local path=$(fake_cluster_active_path $lun_uuid)
+    sudo mkfs.xfs -f -L XFS -b size=4096 -s size=4096 $path
+}
+
+# mount lun
+# $1 - lun_uuid
+function fake_cluster_mount_lun() {
+    local lun_uuid=$1
+    local vol_uuid=${LUN_VOL_UUID[$lun_uuid]}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    local lun_path=$(fake_cluster_active_path $lun_uuid)
+    # pick a mount point
+    LUN_MOUNT_POINT[$lun_uuid]=$vol_server/$lun_uuid
+    mkdir ${LUN_MOUNT_POINT[$lun_uuid]}
+    mount $lun_path ${LUN_MOUNT_POINT[$lun_uuid]}
+}
+
+# unmount lun
+# $1 - lun_uuid
+function fake_cluster_umount_lun() {
+    local lun_uuid=$1
+    echo "unmounting $lun_uuid"
+    umount ${LUN_MOUNT_POINT[$lun_uuid]}
+    unset LUN_MOUNT_POINT[$lun_uuid]
+}
+
+function fake_cluster_umount_all_luns() {
+    echo "unmounting all luns"
+    local luns=${!LUN_MOUNT_POINT[@]}
+    for lun in $luns
+    do
+        fake_cluster_umount_lun $lun
+    done
+}
+
+function fake_cluster_create_pit() {
+    local vol_uuid=$1
+    local pit_uuid=$2
+    local should_fail=${3:-false}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    if [ "$should_fail" = false ] ; then
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} create-pit -v $vol_uuid -p $pit_uuid
+    elif ($NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} create-pit -v $vol_uuid -p $pit_uuid) ; then
+        fake_cluster_failed $should_fail
+    fi
+}
+
+function fake_cluster_delete_pit() {
+    local vol_uuid=$1
+    local pit_uuid=$2
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    local should_fail=${3:-false}
+    if [ "$should_fail" = false ] ; then
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} delete-pit -v $vol_uuid -p $pit_uuid
+    elif $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} delete-pit -v $vol_uuid -p $pit_uuid ; then
+        fake_cluster_failed $should_fail
+    fi
+}
+
+function fake_cluster_pause_io() {
+    local vol_uuid=$1
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} pause-io -v $vol_uuid
+}
+
+function fake_cluster_resume_io() {
+    local vol_uuid=$1
+    local should_fail=${2:-false}
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    if [ "$should_fail" = false ] ; then
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} resume-io -v $vol_uuid
+    elif $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} resume-io -v $vol_uuid ; then
+            fake_cluster_failed $should_fail
+    fi
+}
+
+function fake_cluster_list_pits() {
+    local vol_uuid=$1
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} list-pits -v $vol_uuid
+}
+
+function fake_cluster_debug_trigger() {
+    local server_dir=$TEST_DIR/$1
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} debug-trigger "${@:2}"
+}
+
+# vol_uuid is the volume to trigger gc on
+# policy is the policy.  Currently "oldest", "youngest", "fullest", "emptiest", or all
+function fake_cluster_gc() {
+    local vol_uuid=$1
+    local policy=$2
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} garbage-collect -v $vol_uuid -p $policy
+}
+
+function fake_cluster_log_level() {
+    local server_dir=$TEST_DIR/$1
+    local module=$2
+    local log_level=$3
+    $NUVO_VM_FT_CMD -s  ${NODE_CTRL[$server_dir]} log-level --module-name $module --log-level $log_level
+}
+
+function fake_cluster_log_summary() {
+    local vol_uuid=$1
+    local parcel_index=$2
+    local segment_index=$3
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$vol_server]} log-summary -v $vol_uuid -p $parcel_index -s $segment_index
+}
+
+function fake_cluster_halt() {
+    local server_dir=$1
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server_dir]} halt
+}
+
+function fake_cluster_print_device_state() {
+    local oldstate="$(shopt -po xtrace)"
+    set +x
+    local dev_uuid=$1
+    printf "Device $dev_uuid\n"
+    printf "\tNode:           ${DEV_NODE[$dev_uuid]}\n"
+    printf "\tServer:         ${DEV_SERVER[$dev_uuid]}\n"
+    printf "\tControl socket: ${NODE_CTRL[${DEV_SERVER[$dev_uuid]}]}\n"
+    printf "\tPath:           ${DEV_PATH[$dev_uuid]}\n"
+    printf "\tNum Parcels:    ${DEV_NUM_PARCELS[$dev_uuid]}\n"
+    eval $oldstate
+}
+
+function fake_cluster_print_devices_state() {
+    local oldstate="$(shopt -po xtrace)"
+    set +x
+    for dev_uuid in ${DEV_UUIDS[*]}
+    do
+        fake_cluster_print_device_state $dev_uuid
+    done
+    eval $oldstate
+}
+
+function fake_cluster_print_vol_state() {
+    local oldstate="$(shopt -po xtrace)"
+    set +x
+    local vol_uuid=$1
+    local vol_server=${VOL_SERVER[$vol_uuid]}
+    printf "Volume $vol_uuid\n"
+    printf "\tServer:         ${VOL_SERVER[$vol_uuid]}\n"
+    printf "\tControl socket: ${NODE_CTRL[$vol_server]}\n"
+    printf "\tRoot device:    ${VOL_ROOT_DEV_UUID[$vol_uuid]}\n"
+    printf "\tRoot parcel:    ${VOL_ROOT_PARCEL_UUID[$vol_uuid]}\n"
+    if [ ${LUN_VOL_UUID[$vol_uuid]+true} ] ; then
+        printf "\tExported as uuid: ${LUN_VOL_UUID[$vol_uuid]}\n"
+        printf "\tExported as name: ${LUN_NAME[$vol_uuid]}\n"
+        path=$(fake_cluster_active_path $vol_uuid)
+        printf "\tExport path:      $path\n"
+    else
+        printf "\tNot Exported\n"
+    fi
+    for pit_uuid in ${!PIT_VOL_UUID[@]}
+    do
+        if [ ${PIT_VOL_UUID[$pit_uuid]} = $vol_uuid ] ; then
+            printf "\tPiT : $pit_uuid\n"
+            printf "\t\tExported as : ${PIT_NAME[$pit_uuid]}\n"
+            path=$(fake_cluster_pit_path $pit_uuid)
+            printf "\t\tExport path : $path\n"
+        fi
+    done
+    eval $oldstate
+}
+
+function fake_cluster_print_vols_state() {
+    local oldstate="$(shopt -po xtrace)"
+    set +x
+    for vol_uuid in ${VOL_UUIDS[*]}
+    do
+        fake_cluster_print_vol_state $vol_uuid
+    done
+    eval $oldstate
+}

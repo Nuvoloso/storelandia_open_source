@@ -1,0 +1,61 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="example"
+
+# setup the cluster - a small cluster with small devices for example.
+source ./fake_cluster $1
+num_servers=1
+devices_per_server=2
+size_of_device=1G
+size_of_parcel=102400000
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+# now create and use a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID 1024000000
+VOL_UUID=${VOL_UUIDS[0]}
+
+# add parcels to the volume
+fake_cluster_grow_volume_percent $VOL_UUID 100
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+ls -l ${FUSE_DIR[$VOL_SERVER]}
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+TEMPFILE=/tmp/t$$
+COPYFILE=/tmp/c$$
+RANDFILE=/dev/urandom
+
+# Build the reference file
+dd if=$RANDFILE of=$TEMPFILE bs=128K count=200 2> /dev/null
+
+# Copy the reference file in
+dd if=$TEMPFILE of=$NUVOVOL bs=128K count=200 oflag=direct conv=notrunc 2> /dev/null
+sync
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} manifest -v $VOL_UUID
+rm -f $TEMPFILE $COPYFILE
+
+# Now create a file system
+mkfs -t ext4 -b 4096 $NUVOVOL
+
+fake_cluster_mount_lun $VOL_UUID
+
+# cluster tear-down is handled in finish

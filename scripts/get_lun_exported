@@ -1,0 +1,75 @@
+set -e
+set -x
+set -u
+
+# INSTRUCTIONS
+#
+# Use this script to get a volume up and running using parcels from two nodes.
+#
+# create 
+#    /mnt/nuvoloso1 
+#    /mnt/nuvoloso2 
+#    /mnt/vol1
+#
+# Copy a nuvo_vm into this directory.
+#
+# Run two nuvo processes the pair of lines below.
+# Someone could make this fancier.  I am not that person.
+#
+# sudo gdb --args build/Debug/nuvo/nuvo -f /mnt/nuvoloso1 socket=/tmp/sock1 port=32423
+# sudo gdb --args build/Debug/nuvo/nuvo -f /mnt/nuvoloso2 socket=/tmp/sock2 port=32424
+
+NODE1_SOCKET=/tmp/sock1
+NODE1_UUID=cdea706c-a0ef-11e7-abc4-cec278b6b50a
+NODE1_PORT=32423
+NODE2_SOCKET=/tmp/sock2
+NODE2_UUID=cdea706c-a0ef-11e7-abc4-cec278b6b50b
+NODE2_PORT=32424
+
+DEV1=~/file1
+truncate -s 1024000000 $DEV1
+DEV2=~/file2
+truncate -s 1024000000 $DEV2
+
+DEV1_UUID=$( uuidgen )
+DEV2_UUID=$( uuidgen )
+VOL1_UUID=$( uuidgen )
+VOL2_UUID=$( uuidgen )
+
+ROOT_PARCEL=$( uuidgen )
+
+./nuvo_vm -s $NODE1_SOCKET use-node-uuid -u $NODE1_UUID
+./nuvo_vm -s $NODE2_SOCKET use-node-uuid -u $NODE2_UUID
+
+./nuvo_vm -s $NODE1_SOCKET format-device -p 102400000 -d $DEV1 -u $DEV1_UUID
+./nuvo_vm -s $NODE2_SOCKET format-device -p 102400000 -d $DEV2 -u $DEV2_UUID
+
+./nuvo_vm -s $NODE1_SOCKET use-device -d $DEV1 -u $DEV1_UUID
+./nuvo_vm -s $NODE2_SOCKET use-device -d $DEV2 -u $DEV2_UUID
+
+./nuvo_vm -s $NODE1_SOCKET node-location -n $NODE2_UUID -i "127.0.0.1" -p $NODE2_PORT
+./nuvo_vm -s $NODE2_SOCKET node-location -n $NODE1_UUID -i "127.0.0.1" -p $NODE1_PORT
+
+./nuvo_vm -s $NODE1_SOCKET device-location -d $DEV1_UUID -n $NODE1_UUID
+./nuvo_vm -s $NODE2_SOCKET device-location -d $DEV1_UUID -n $NODE1_UUID
+./nuvo_vm -s $NODE2_SOCKET device-location -d $DEV2_UUID -n $NODE2_UUID
+./nuvo_vm -s $NODE1_SOCKET device-location -d $DEV2_UUID -n $NODE2_UUID
+
+root_parcel_ret=$( ./nuvo_vm -s $NODE1_SOCKET create-parcel-volume -d $DEV1_UUID -v $VOL1_UUID -p $ROOT_PARCEL )
+
+if [ $ROOT_PARCEL != $root_parcel_ret ] ; then
+	echo =====================================
+	echo The returned Root parcel did not match
+	echo =====================================
+fi
+
+./nuvo_vm -s $NODE1_SOCKET alloc-parcels -d $DEV1_UUID -v $VOL1_UUID -n 1
+./nuvo_vm -s $NODE1_SOCKET alloc-parcels -d $DEV2_UUID -v $VOL1_UUID -n 1
+
+./nuvo_vm -s $NODE1_SOCKET export -v $VOL1_UUID -e vol1
+LOOPDEV=$( losetup --find --show /mnt/nuvoloso1/vol1 )
+export MKE2FS_DEVICE_SECTSIZE=4096
+mkfs -t ext4 -b 4096 $LOOPDEV
+#mkfs.xfs -f -L XFS -b size=4096 -s size=4096 $LOOPDEV
+ls -l /mnt/nuvoloso1
+mount /mnt/nuvoloso1/vol1 /mnt/vol1

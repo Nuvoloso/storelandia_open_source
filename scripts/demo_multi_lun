@@ -1,0 +1,90 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -e
+set -x
+set -u
+
+TEST_NAME="demo multi lun script"
+
+# ASSUMES:
+#    - you have done build
+#    - are running from storelandia/scripts
+#    - have a storelandia/scripts/nuvo_vm
+# If you want to run nuvo (or nuvo_gperftools) under a tool:
+#   GDB:
+#       export NUVO_FUNC_TEST_TOOL=gdb
+#   VALGRIND:
+#       export NUVO_FUNC_TEST_TOOL=valgrind
+#   CALLGRIND:
+#       export NUVO_FUNC_TEST_TOOL=callgrind
+sudo -v
+source ../build/Debug/nuvo/func_tests/log_vol/fake_cluster ./nuvo_vm ../build/Debug/
+if [ ! -f ../build/Debug/nuvo/func_tests/log_vol/fake_cluster ]; then
+   echo "Script ../build/Debug/nuvo/func_tests/log_vol/fake_cluster does not exist."
+   exit
+fi
+if [ ! -f ../build/Debug/nuvo/nuvo ]; then
+   echo "Script ../build/Debug/nuvo/nuvo does not exist."
+   exit
+fi
+if [ ! -f ./nuvo_vm ]; then
+   echo "Need nuvo_vm command."
+   exit
+fi
+
+# cluster parameters change these if you want
+num_servers=1
+devices_per_server=2
+size_of_device=5G
+size_of_parcel=$(expr 64 \* 1024 \* 1024)
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+# Now going to create a volume.
+#    - If you have mutiple servers and want a volume with root
+#      on a "remote" nuvo, change the 0 to 1 in ROOT_DEVICE_UUID
+for dev_uuid in ${DEV_UUIDS[*]}
+do
+	VOL_SERVER=${DEV_SERVER[$dev_uuid]}
+	volume_size=40960000000
+	vol_uuid=$( uuidgen )
+	fake_cluster_create_vol $VOL_SERVER $dev_uuid $volume_size $vol_uuid
+	# add parcels to the volume
+	fake_cluster_grow_volume_device_percent $vol_uuid $dev_uuid 80
+
+	# export the active lun
+	fake_cluster_export_active $vol_uuid
+	active=$(fake_cluster_active_path $vol_uuid)
+
+	fio --name=write --rw=write --size=1G --ioengine=libaio --iodepth=1 --bs=128K --direct=1 --numjobs=1 --unlink=0 --filename=$active
+
+	for i in `seq 1 1` ; do
+		pituuid=`uuidgen`
+		fake_cluster_pause_io $vol_uuid
+		fake_cluster_create_pit $vol_uuid $pituuid
+		fake_cluster_resume_io $vol_uuid
+		fake_cluster_export_pit $vol_uuid $pituuid
+	done
+done
+
+fake_cluster_print_devices_state
+fake_cluster_print_vols_state
+
+# You could do other things here
+# Mostly this just pauses so you can play
+
+set +x
+prompt "Hit Enter to Shut things down"
+set -x

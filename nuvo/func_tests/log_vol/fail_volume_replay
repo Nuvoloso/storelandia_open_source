@@ -1,0 +1,76 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="fail_volume_replay"
+
+# This tests the avoidance of replay reboot loops
+# First creates and exports a new volume, writes data to the volume, and closes it.
+# The TEST_FI_GENERAL_USE_FAIL_VOL_REPLAY trigger is set to force a replay failure the next three times
+# Exit on error is disabled and volume open is tried NUVO_MAX_REPLAY_ATTEMPTS times, the operations are expected to fail.
+# An additional volume open is performed, which should fail due to exceeding the NUVO_MAX_REPLAY_ATTEMPTS.
+# Exit on error is reenabled.
+# The TEST_FI_GENERAL_VER_GIT_COMMIT_HASH_OVERRIDE trigger is set to override the git_hash, which simulates a new software version.
+# The next volume open is expected to succeed.
+# The volume is then closed and opened and closed to confirm it's back to normal operation after the forced failures.
+
+#Fault Injection
+TEST_FI_GENERAL_USE_FAIL_VOL_REPLAY=101
+TEST_FI_GENERAL_VER_GIT_COMMIT_HASH_OVERRIDE=102
+
+#Replay retry count
+NUVO_MAX_REPLAY_ATTEMPTS=3
+
+# setup the cluster - a small cluster with small devices for example.
+source ./fake_cluster $1
+num_servers=1
+devices_per_server=2
+size_of_device=5G
+size_of_parcel=512000000
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+NODE_UUID=${DEV_NODE[$ROOT_DEVICE_UUID]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID 4096000000
+
+VOL_UUID=${VOL_UUIDS[0]}
+fake_cluster_grow_volume_percent $VOL_UUID 100
+fake_cluster_export_active $VOL_UUID
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+
+fio --name=seqwrite --rw=write --size=256M --ioengine=libaio --iodepth=1 --bs=64K --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL
+
+fake_cluster_unexport_active $VOL_UUID
+fake_cluster_close_vol $VOL_UUID
+
+FI_ERR_TYPE=${TEST_FI_GENERAL_USE_FAIL_VOL_REPLAY}
+FI_ERR_CODE=-1
+fake_cluster_debug_trigger 1 debug-trigger --trigger "fi_general_use" --volume $VOL_UUID --node ${NODE_UUID} --error-type ${FI_ERR_TYPE} --return-code ${FI_ERR_CODE} --repeat-cnt ${NUVO_MAX_REPLAY_ATTEMPTS} --skip-cnt 0
+
+set +e
+for i in {1 .. ${NUVO_MAX_REPLAY_ATTEMPTS}}; do
+    fake_cluster_open_vol $VOL_UUID
+done
+fake_cluster_open_vol $VOL_UUID
+set -e
+
+FI_ERR_TYPE=${TEST_FI_GENERAL_VER_GIT_COMMIT_HASH_OVERRIDE}
+FI_ERR_CODE=0xDEADBAC
+fake_cluster_debug_trigger 1 debug-trigger --trigger "fi_general_use" --volume $VOL_UUID --node ${NODE_UUID} --error-type ${FI_ERR_TYPE} --return-code $((${FI_ERR_CODE})) --repeat-cnt 1 --skip-cnt 0
+fake_cluster_open_vol $VOL_UUID
+fake_cluster_close_vol $VOL_UUID
+fake_cluster_open_vol $VOL_UUID
+fake_cluster_close_vol $VOL_UUID

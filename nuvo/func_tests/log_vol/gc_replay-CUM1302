@@ -1,0 +1,159 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="GC REPLAY CUM1302"
+
+if [ "$#" -ne 9 ] ; then
+    echo "USAGE: gc_replay-CUM1302 nuvo_vm_cmd num_servers num_devices num_parcels parcel_size io_range io_size blk_size num_snaps"
+    echo "USAGE: num servers in cluster"
+    echo "USAGE: num_devices is number of devices"
+    echo "USAGE: num_parcels is parcels per device"
+    echo "USAGE: parcel_size is in MB"
+    exit 1
+fi
+NUVO_VM=$1
+PARAM_NUM_SERVERS=$2
+PARAM_NUM_DEVICES_PER_SERVER=$3
+PARAM_NUM_PARCELS=$4
+PARAM_PARCEL_SIZE=$5
+PARAM_IO_RANGE_MB=$6
+PARAM_IO_SIZE_MB=$7
+PARAM_IO_BLK_SIZE=$8
+PARAM_IO_NUM_SNAPS=$9
+
+# TODO - loop to use num snaps
+size_of_parcel=$(expr $PARAM_PARCEL_SIZE \* 1024 \* 1024)
+size_of_device=$(expr $PARAM_NUM_PARCELS \* $size_of_parcel + 16 \* 1024 \* 1024)
+fio_size=$(expr $PARAM_IO_RANGE_MB \* 1024 \* 1024)
+io_size=$(expr $PARAM_IO_SIZE_MB \* 1024 \* 1024)
+
+# setup the cluster
+source ./fake_cluster $NUVO_VM
+
+fake_cluster_create $PARAM_NUM_SERVERS $PARAM_NUM_DEVICES_PER_SERVER $size_of_device $size_of_parcel
+
+# now create and use a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID $(expr 20 \* 1024 \* 1024 \* 1024)
+VOL_UUID=${VOL_UUIDS[0]}
+
+# add parcels to the volume
+fake_cluster_grow_volume_percent $VOL_UUID 100
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+
+rand_seed1=$RANDOM
+fio --name=test --verify=crc32c --rw=randwrite --size=$fio_size --io_size=$io_size --ioengine=libaio --iodepth=1\
+     --bs=$PARAM_IO_BLK_SIZE --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed $rand_seed1
+PIT1_UUID=$( uuidgen )
+fake_cluster_pause_io $VOL_UUID
+fake_cluster_create_pit $VOL_UUID $PIT1_UUID
+fake_cluster_resume_io $VOL_UUID
+
+# This avoids CUM-1183
+fake_cluster_debug_trigger 1 --trigger "cp_start" --volume $VOL_UUID
+
+rand_seed2=$RANDOM
+fio --name=test --verify=crc32c --rw=randwrite --size=$fio_size --io_size=$io_size --ioengine=libaio --iodepth=1\
+     --bs=$PARAM_IO_BLK_SIZE --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed $rand_seed2
+
+fake_cluster_debug_trigger 1 --trigger "cp_start" --volume $VOL_UUID
+
+PIT2_UUID=$( uuidgen )
+fake_cluster_pause_io $VOL_UUID
+fake_cluster_create_pit $VOL_UUID $PIT2_UUID
+fake_cluster_resume_io $VOL_UUID
+
+fake_cluster_debug_trigger 1 --trigger "cp_start" --volume $VOL_UUID
+
+rand_seed3=$RANDOM
+fio --name=test --verify=crc32c --rw=randwrite --size=$fio_size --io_size=$io_size --ioengine=libaio --iodepth=1\
+     --bs=$PARAM_IO_BLK_SIZE --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed $rand_seed3
+
+fake_cluster_delete_pit $VOL_UUID $PIT1_UUID
+
+fake_cluster_debug_trigger 1 --trigger "cp_start" --volume $VOL_UUID
+
+# Loop over calculated number of parcels and segments
+fake_cluster_vol_manifest $VOL_UUID gc_replay_1.png
+# loop once doing CPs and once not doing CPs.
+for i in $(seq 1 20) ; do
+    fake_cluster_debug_trigger 1  --trigger "gc_segment" --volume $VOL_UUID --parcel-index 0 --segment-index $i --multi-use1 0
+done
+fake_cluster_vol_manifest $VOL_UUID gc_replay_2.png
+for i in $(seq 1 20) ; do
+    fake_cluster_debug_trigger 1  --trigger "gc_segment" --volume $VOL_UUID --parcel-index 0 --segment-index $i --multi-use1 1
+done
+fake_cluster_vol_manifest $VOL_UUID gc_replay_3.png
+
+fake_cluster_export_pit $VOL_UUID $PIT2_UUID "pit2"
+PIT2=$(fake_cluster_pit_path $PIT2_UUID)
+
+fio --name=test --verify_only --verify=crc32c --rw=randwrite --size=$fio_size --io_size=$io_size --ioengine=libaio\
+    --iodepth=1 --bs=$PARAM_IO_BLK_SIZE --direct=1 --numjobs=1 --unlink=0 --filename=$PIT2 --randseed $rand_seed2
+fio --name=test --verify_only --verify=crc32c --rw=randwrite --size=$fio_size --io_size=$io_size --ioengine=libaio\
+    --iodepth=1 --bs=$PARAM_IO_BLK_SIZE --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed $rand_seed3
+
+fake_cluster_unexport_active $VOL_UUID
+fake_cluster_unexport_pit $PIT2_UUID
+fake_cluster_close_vol $VOL_UUID
+echo 3 > /proc/sys/vm/drop_caches
+fake_cluster_open_vol $VOL_UUID
+fake_cluster_export_active $VOL_UUID
+fake_cluster_export_pit $VOL_UUID $PIT2_UUID "pit2"
+
+fio --name=test --verify_only --verify=crc32c --rw=randwrite --size=$fio_size --io_size=$io_size --ioengine=libaio\
+    --iodepth=1 --bs=$PARAM_IO_BLK_SIZE --direct=1 --numjobs=1 --unlink=0 --filename=$PIT2 --randseed $rand_seed2
+fio --name=test --verify_only --verify=crc32c --rw=randwrite --size=$fio_size --io_size=$io_size --ioengine=libaio\
+    --iodepth=1 --bs=$PARAM_IO_BLK_SIZE --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed $rand_seed3
+
+fake_cluster_unexport_pit $PIT2_UUID
+fake_cluster_delete_pit $VOL_UUID $PIT2_UUID
+
+# loop once doing CPs and once not doing CPs.
+for i in $(seq 1 20) ; do
+    fake_cluster_debug_trigger 1  --trigger "gc_segment" --volume $VOL_UUID --parcel-index 0 --segment-index $i --multi-use1 0
+done
+for i in $(seq 1 20) ; do
+    fake_cluster_debug_trigger 1  --trigger "gc_segment" --volume $VOL_UUID --parcel-index 0 --segment-index $i --multi-use1 1
+done
+fake_cluster_vol_manifest $VOL_UUID gc_replay_4.png
+
+fake_cluster_unexport_active $VOL_UUID
+fake_cluster_close_vol $VOL_UUID
+echo 3 > /proc/sys/vm/drop_caches
+fake_cluster_open_vol $VOL_UUID
+fake_cluster_export_active $VOL_UUID
+
+# loop once doing CPs and once not doing CPs.
+for i in $(seq 1 20) ; do
+    fake_cluster_debug_trigger 1  --trigger "gc_segment" --volume $VOL_UUID --parcel-index 0 --segment-index $i --multi-use1 0
+done
+for i in $(seq 1 20) ; do
+    fake_cluster_debug_trigger 1  --trigger "gc_segment" --volume $VOL_UUID --parcel-index 0 --segment-index $i --multi-use1 1
+done
+fake_cluster_vol_manifest $VOL_UUID gc_replay_5.png
+
+fio --name=test --verify_only --verify=crc32c --rw=randwrite --size=$fio_size --io_size=$io_size --ioengine=libaio\
+    --iodepth=1 --bs=$PARAM_IO_BLK_SIZE --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed $rand_seed3
+# cluster tear-down is handled in finish

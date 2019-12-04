@@ -1,0 +1,91 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="CUM 1515"
+
+if [ "$#" -ne 6 ] ; then
+    echo "USAGE: gc nuvo_vm_cmd num_devices num_parcels parcel_size percent_used percent_to_write"
+    echo "USAGE: num_devices is number of devices"
+    echo "USAGE: num_parcels is parcels per device"
+    echo "USAGE: parcel_size is in MB"
+    echo "USAGE: percent used is lun size as percentage of parcel space"
+    echo "USAGE: percent_to_write percent to of allocated size to write"
+    exit 1
+fi
+
+NUVO_VM=$1
+PARAM_NUM_DEVICES=$2
+PARAM_NUM_PARCELS=$3
+PARAM_PARCEL_SIZE=$4
+PARAM_PERCENT_USED=$5
+PARAM_PERCENT_TO_WRITE=$6
+
+size_of_parcel=$(expr $PARAM_PARCEL_SIZE \* 1024 \* 1024)
+size_of_device=$(expr $PARAM_NUM_PARCELS \* $size_of_parcel + 16 \* 1024 \* 1024)
+
+# setup the cluster
+source ./fake_cluster $NUVO_VM
+fake_cluster_create 1 $PARAM_NUM_DEVICES $size_of_device $size_of_parcel
+
+allocated_space_mb=$(expr $PARAM_NUM_DEVICES \* $PARAM_NUM_PARCELS \* $PARAM_PARCEL_SIZE)
+lun_size=$(expr $allocated_space_mb \* $PARAM_PERCENT_USED / 100 \* 1024 \* 1024 )
+
+
+# now create and use a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID $lun_size
+VOL_UUID=${VOL_UUIDS[0]}
+
+fake_cluster_grow_volume_percent $VOL_UUID 100
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+
+# read data from active
+# this would load the map trees
+
+fio --name=test  --rw=randread --size=$lun_size --io_size=20M --ioengine=libaio --iodepth=1 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed 20
+
+declare -a PIT_UUID
+
+function create_test_pit() {
+    local pit_i=$1
+    PIT_UUID[$pit_i]=$( uuidgen )
+    fake_cluster_pause_io $VOL_UUID
+    fake_cluster_create_pit $VOL_UUID ${PIT_UUID[$pit_i]}
+    fake_cluster_resume_io $VOL_UUID
+}
+
+# create pit.
+create_test_pit 0
+
+# reread. This would dirty the L>1 maps, now that they are aware of pit create
+fio --name=test  --rw=randread --size=$lun_size --io_size=20M --ioengine=libaio --iodepth=1 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed 20
+
+fake_cluster_unexport_active $VOL_UUID
+#this would write out the maps. The L>1 maps that are dirty would come back in replay
+fake_cluster_close_vol $VOL_UUID
+#replay should now see a parent map entry has a const pointer to a map that is getting replayed.
+fake_cluster_open_vol $VOL_UUID
+# cluster tear-down is handled in finish
+
+# we didnt write anything, nothing to verify

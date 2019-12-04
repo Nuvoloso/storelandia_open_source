@@ -1,0 +1,163 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="PiT Extended"
+
+# setup the cluster - a small cluster with small devices for example.
+source ./fake_cluster $1
+num_servers=1
+devices_per_server=2
+size_of_device=512M
+size_of_parcel=67108864
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+# now create and use a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+# Test wants two volumes
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID 1024000000
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID 1024000000
+
+# add parcels to the volume
+fake_cluster_grow_volume_percent ${VOL_UUIDS[0]} 40
+fake_cluster_grow_volume_percent ${VOL_UUIDS[1]} 40
+
+VOL_UUID=${VOL_UUIDS[0]}
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+SOCKET=${NUVO_DIRS[0]/nuvo_ctrl}
+TEMPFILE=/tmp/t$$
+COPYFILE=/tmp/c$$
+RANDFILE=/dev/urandom
+
+pit_uuid=$( uuidgen )
+
+echo "Creating PiT without being paused"
+fake_cluster_create_pit $VOL_UUID $pit_uuid "create-pit without pause should have failed but succeeded"
+echo "pausing IO"
+fake_cluster_pause_io $VOL_UUID
+echo "pausing IO already paused"
+fake_cluster_pause_io $VOL_UUID
+echo "listing No PiTs"
+fake_cluster_list_pits $VOL_UUID
+echo "creating PiT"
+fake_cluster_create_pit $VOL_UUID $pit_uuid
+echo "listing PiTs, one exists"
+fake_cluster_list_pits $VOL_UUID
+
+echo "creating PiT Duplicate UUID"
+fake_cluster_create_pit $VOL_UUID $pit_uuid "create-pit with a duplicate uuid should have failed but succeeded"
+
+echo "delete PiT while paused"
+fake_cluster_delete_pit $VOL_UUID $pit_uuid "delete-pit while paused failed but succeeded"
+
+fake_cluster_resume_io $VOL_UUID
+
+fake_cluster_delete_pit $VOL_UUID $pit_uuid
+echo "delete non-existent pit"
+fake_cluster_delete_pit $VOL_UUID $pit_uuid "delete of non-existent PiT should fail"
+
+sync
+echo "Snapshot export exercise"
+for i in `seq 1 20` ; do
+    pituuid=`uuidgen`
+    fake_cluster_pause_io $VOL_UUID
+    fake_cluster_create_pit $VOL_UUID $pituuid
+    fake_cluster_resume_io $VOL_UUID
+    fake_cluster_export_pit $VOL_UUID $pituuid
+    NUVOPIT=$(fake_cluster_pit_path $pituuid)
+
+    sudo strace -o /tmp/out dd if=${NUVOPIT} of=/dev/null bs=1M count=1
+    result=$?
+    if [ $result == "1" ] ; then
+        failed "export failed after $i attempts"
+    fi
+
+    fake_cluster_unexport_pit $pituuid
+    fake_cluster_delete_pit $VOL_UUID $pituuid
+done
+
+#basic PIT data integrity tests
+PIT_UUIDS=()
+VOL_UUID=${VOL_UUIDS[1]}
+fake_cluster_export_active $VOL_UUID
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+# Create 10 pits, keep writing to the HEAD in ten iterations
+# save the data written to HEAD and verify those back from 10 pits
+
+for i in `seq 0 9`
+do
+    echo $i
+    pituuid_2=$( uuidgen )
+    PIT_UUIDS+=($pituuid_2)
+    REFERENCEFILE=/tmp/r1$$
+    COPYFILE=/tmp/c$
+    RANDFILE=/dev/urandom
+
+    # Build the reference files
+
+    dd if=$RANDFILE of=$REFERENCEFILE$i bs=4096 count=100
+
+
+    # Writes to the head
+    dd if=$REFERENCEFILE$i of=$NUVOVOL bs=4096 count=100 oflag=direct conv=notrunc
+
+    # Reads from head to a copyfile
+    dd if=$NUVOVOL of=$COPYFILE bs=4096 count=100 iflag=direct
+
+    # Compare the read file against the reference file
+    cmp $REFERENCEFILE$i $COPYFILE
+    if [ $? -ne 0 ] ; then
+        failed "miscompare on active on $i"
+    else
+        echo passed "compare pass on active on $i"
+    fi
+
+    #pause, create and export a pit
+    echo "pausing IO"
+    fake_cluster_pause_io $VOL_UUID
+    #create pit
+    echo "creating PiT"
+    fake_cluster_create_pit $VOL_UUID $pituuid_2
+    #export
+    fake_cluster_export_pit $VOL_UUID $pituuid_2 pit$i
+
+    fake_cluster_resume_io $VOL_UUID
+
+done
+ls -l ${FUSE_DIR[$VOL_SERVER]}
+# Now read back from the pits
+for i in `seq 0 9`
+do
+    NUVO_PIT=$(fake_cluster_pit_path ${PIT_UUIDS[$i]})
+    # Reads from snap
+    dd if=$NUVO_PIT of=$COPYFILE bs=4096 count=100 iflag=direct
+
+    #Compare with the ith reference file
+    cmp $REFERENCEFILE$i $COPYFILE
+    if [ $? -ne 0 ] ; then
+       failed "PIT miscompare after divergence for $i"
+    else
+      echo passed "PIT compare pass after divergence for $i"
+    fi
+
+    #####
+    #unexport and delete pit
+    fake_cluster_unexport_pit ${PIT_UUIDS[$i]}
+    fake_cluster_delete_pit $VOL_UUID ${PIT_UUIDS[$i]}
+    rm -rf $REFERENCEFILE$i
+    rm -rf $COPYFILE
+done

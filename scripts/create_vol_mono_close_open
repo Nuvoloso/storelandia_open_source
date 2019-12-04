@@ -1,0 +1,81 @@
+#!/bin/bash
+
+set -e
+set -x
+set -u
+
+resp=
+
+prompt() {
+    echo -n $*
+    read resp
+}
+
+# INSTRUCTIONS
+#
+# Use this script to get a log volume up and running using one parcel from one node.
+#
+# Start up the nuvo process under gdb.
+#
+# sudo gdb --args build/Debug/nuvo/nuvo -f /mnt/nuvoloso1 socket=/tmp/sock1 port=32423
+#
+# Then run this script with sudo.
+
+NODE1_SOCKET=/tmp/sock1
+NODE1_UUID=cdea706c-a0ef-11e7-abc4-cec278b6b50a
+NODE1_PORT=32423
+
+DEV1=~/file1
+truncate -s 1024000000 $DEV1
+
+DEV1_UUID=$( uuidgen )
+VOL1_UUID=$( uuidgen )
+
+ROOT_PARCEL=$( uuidgen )
+
+set +x
+if [ ! -d /mnt/nuvoloso1 ] || [ ! -d /mnt/vol1 ] ; then
+    echo "Creating some mount points"
+    mkdir -p /mnt/nuvoloso1 /mnt/vol1
+fi
+
+if [ ! -f ./nuvo_vm ] ; then
+    echo "./nuvo_vm not found"
+    echo -n "Where can I find ./nuvo_vm? "
+    read nuvoloc
+
+    if [ -f ${nuvoloc}/nuvo_vm ] ; then
+        cp ${nuvoloc}/nuvo_vm .
+    else
+        echo "Couldn't find the nuvo_vm in ${nuvoloc}"
+        exit 1
+    fi
+fi
+set -x
+
+./nuvo_vm -s $NODE1_SOCKET use-node-uuid -u $NODE1_UUID
+
+./nuvo_vm -s $NODE1_SOCKET format-device -p 102400000 -d $DEV1 -u $DEV1_UUID
+
+./nuvo_vm -s $NODE1_SOCKET use-device -d $DEV1 -u $DEV1_UUID
+
+./nuvo_vm -s $NODE1_SOCKET device-location -d $DEV1_UUID -n $NODE1_UUID
+
+root_parcel_ret=$( ./nuvo_vm -s $NODE1_SOCKET create-volume -d $DEV1_UUID -v $VOL1_UUID -p $ROOT_PARCEL -s 512000000 )
+./nuvo_vm -s $NODE1_SOCKET alloc-parcels -d $DEV1_UUID -v $VOL1_UUID -n 4
+./nuvo_vm -s $NODE1_SOCKET export -v $VOL1_UUID -e vol1
+./nuvo_vm -s $NODE1_SOCKET unexport -v $VOL1_UUID -e vol1
+./nuvo_vm -s $NODE1_SOCKET close-volume -v $VOL1_UUID
+./nuvo_vm -s $NODE1_SOCKET open-volume -d $DEV1_UUID -v $VOL1_UUID -p $ROOT_PARCEL
+
+prompt "Hit Enter to Shut things down"
+set -x
+
+
+# shutdown
+umount /mnt/vol1
+set +x ; prompt "Unmounted, shutdown via nuvo"; set -x
+
+./nuvo_vm -s $NODE1_SOCKET unexport -v $VOL1_UUID -e vol1
+./nuvo_vm -s $NODE1_SOCKET close-volume -v $VOL1_UUID
+./nuvo_vm -s $NODE1_SOCKET halt

@@ -1,0 +1,511 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+echo "---------- STARTING PARCEL VOLUME FUNC TEST ----------"
+set -x
+set -e
+set -u
+
+# Pass in the nuvo command
+if [ "$#" -eq 0 ] ; then
+  echo "USAGE: `basename $0` <nuvo_vm location>"
+  exit 1
+fi
+NUVO_VM_FT_CMD=$1
+
+# Point to the NUVO_CMD in this tree.
+NUVO_CMD="../../nuvo"
+EPHEM_CMD="../../../util/nuvo_ephemeral"
+
+# Run valgrind - could be extended to other tools
+if [ $NUVO_FUNC_TEST_TOOL = "valgrind" ]; then
+    VALGRIND_CMD="valgrind --error-exitcode=1 --leak-check=full\
+            --num-callers=20 --trace-children=yes\
+            --track-origins=yes --gen-suppressions=all\
+            --suppressions=valgrind_supp.xml"
+else
+    VALGRIND_CMD=""
+fi
+
+# Create a directory
+TEST_DIR=`mktemp -d /tmp/nuvo_test.XXXXXXXXXXXXXXXX`
+echo "Created test directory $TEST_DIR"
+
+# Will identify servers with directories.Then keep the
+# key variables in associative arrays keyed by the directory
+NUVO_DIRS=( $TEST_DIR/1 $TEST_DIR/2 )
+declare -A FUSE_PID
+declare -A FUSE_DIR
+declare -A NODE_UUID
+declare -A NODE_PORT
+declare -A NODE_CTRL
+
+# Keep "devices" keyed by device UUID
+DEV_UUIDS=()
+declare -A DEV_PATH
+declare -A DEV_NODE
+declare -A DEV_SERVER
+
+# Volumes keyed by device UUID
+VOL_UUIDS=()
+REMOTE_VOL_UUIDS=()
+VOLNO=0
+declare -A VOL_DEV_UUID
+declare -A VOL_DEV_ROOT
+declare -A VOL_SERVER
+declare -A VOL_LUN_NAME
+
+function finish {
+    local lc="$BASH_COMMAND" rc=$?
+    set +e
+    set +x
+    set +u
+    echo "Cleaning Up"
+    if [ ! -z "$SERVER" ]; then
+        umount $SERVER/vol
+    fi
+    for d in ${NUVO_DIRS[*]}
+    do
+        echo Tearing down nuvo: $d
+        umount -v ${FUSE_DIR[$d]} && echo unmounted ${FUSE_DIR[$d]}
+    done
+    for d in ${NUVO_DIRS[*]}
+    do
+        wait ${FUSE_PID[$d]}
+        valgrind_status=$?
+        if [ $valgrind_status -eq 0 ]; then
+            echo "valgrind and $NUVO_CMD exited cleanly"
+        else
+            if [ $rc -eq 0 ]; then
+                rc=$valgrind_status
+                lc="valgrind"
+            fi
+        fi
+    done
+    rm -rf $TEST_DIR
+    if [ $rc -eq 0 ]; then
+        echo "-----------------------------------------"
+        echo "PARCEL VOLUME FUNC TEST"
+        echo SUCCESS
+        echo "-----------------------------------------"
+    else
+        echo "-----------------------------------------"
+        echo "PARCEL VOLUME FUNC TEST"
+        echo FAILED
+        echo COMMAND [$lc]
+        echo EXITED WITH CODE [$rc]
+        echo "-----------------------------------------"
+    fi
+    exit $rc
+}
+trap finish EXIT
+
+function failed() {
+    echo "-----------------------------------------"
+    echo "DECLARING FAILURE"
+    echo "ERROR - $1"
+    echo "-----------------------------------------"
+    exit 1
+}
+
+# Launch a nuvo process
+# $1 working directory
+# This will create a mnt directory,
+# Within a directory we will build:
+#    $1/d[123]   - virtual disks
+#    $1/fuse     - the directory luns appear in
+#    $1/nuvo_socket - the control socket
+function launch_nuvo {
+    # Create FUSE directory
+    FUSE_DIR[$1]=$1/fuse
+    mkdir -p ${FUSE_DIR[$1]}
+    NODE_CTRL[$1]=$1/nuvo_ctrl
+    NODE_UUID[$1]=$( uuidgen )
+    # Get an ephemeral port left in TIME_WAIT state soe
+    # we can pass it into the fuse process and know we
+    # are not having collisions
+    NODE_PORT[$1]=$( $EPHEM_CMD )
+
+    # Start up the volume manager
+    echo "Starting nuvo process in $1"
+
+    $VALGRIND_CMD $NUVO_CMD -f ${FUSE_DIR[$1]} socket=${NODE_CTRL[$1]}\
+        port=${NODE_PORT[$1]} &
+    FUSE_PID[$1]=$!
+    for i in {1..30}
+    do
+          if [ -e ${NODE_CTRL[$1]} ]; then
+              break
+          fi
+          echo "Waiting for socket"
+        sleep 2
+    done
+
+    if [ ! -e ${NODE_CTRL[$1]} ]; then
+        failed "Socket never came up"
+    fi
+
+    if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$1]} open-parcel-volume -v $( uuidgen ) -d $( uuidgen ) -p $( uuidgen ); then
+        failed "open-parcel-volume should have failed before use-node-uuid but succeeded"
+    fi
+
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$1]} -v use-node-uuid -u ${NODE_UUID[$1]}
+
+    # create a couple of 1G devices on this node, format and use them.
+    declare -a dev_name=("1Ga" "1Gb")
+    for d in "${dev_name[@]}"
+    do
+        DEV_UUID=$( uuidgen )
+        DEV_UUIDS+=($DEV_UUID)
+        DEV_NODE[$DEV_UUID]=${NODE_UUID[$1]}
+        DEV_SERVER[$DEV_UUID]=$1
+        DEV_PATH[$DEV_UUID]=$1/$d
+        truncate -s 1G ${DEV_PATH[$DEV_UUID]}
+        echo "        Created disk" ${DEV_NODE[$DEV_UUID]} ${DEV_PATH[$DEV_UUID]}
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$1]} -v format-device -p 102400000 -d ${DEV_PATH[$DEV_UUID]} -u=$DEV_UUID
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$1]} -v use-device -d ${DEV_PATH[$DEV_UUID]} -u=$DEV_UUID
+    done
+}
+
+# Set up basic servers
+for d in ${NUVO_DIRS[*]}
+do
+    launch_nuvo $d
+done
+
+# Now tell each server where the other is.
+for d1 in ${NUVO_DIRS[*]}
+do
+    for d2 in ${NUVO_DIRS[*]}
+    do
+        if [ $d1 != $d2 ] ; then
+            $NUVO_VM_FT_CMD -s ${NODE_CTRL[$d1]} -v node-location -n ${NODE_UUID[$d2]} -i "127.0.0.1" -p ${NODE_PORT[$d2]}
+        fi
+    done
+done
+
+# Now tell each server the location of every device.
+for d in ${NUVO_DIRS[*]}
+do
+    for dev in ${DEV_UUIDS[*]}
+    do
+        echo $d $dev
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$d]} -v device-location -d $dev -n ${DEV_NODE[$dev]}
+    done
+done
+
+# Now create a parcel volume per device (i.e. each device
+# has one volume root parcel
+for dev in ${DEV_UUIDS[*]}
+do
+    VOL_UUID=$( uuidgen )
+    ROOT_PARCEL_UUID=$( uuidgen )
+    VOL_UUIDS+=($VOL_UUID)
+    VOL_DEV_UUID[$VOL_UUID]=$dev
+    ROOT_PARCEL=$( $NUVO_VM_FT_CMD -s ${NODE_CTRL[${DEV_SERVER[$dev]}]} create-parcel-volume -d $dev -v $VOL_UUID -p $ROOT_PARCEL_UUID )
+    LAST_CREATE_ROOT_CMD="$NUVO_VM_FT_CMD -s ${NODE_CTRL[${DEV_SERVER[$dev]}]} create-parcel-volume -d $dev -v $VOL_UUID -p $ROOT_PARCEL_UUID"
+    if [ "$ROOT_PARCEL_UUID" != "$ROOT_PARCEL" ] ; then
+        failed "Root parcel UUID not expected"
+    fi
+    VOL_DEV_ROOT[$VOL_UUID]=$ROOT_PARCEL
+    echo Created parcel volume $VOL_UUID $dev $ROOT_PARCEL
+    VOL_LUN_NAME[$VOL_UUID]=$VOL_UUID
+
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[${DEV_SERVER[$dev]}]} export -v $VOL_UUID -e ${VOL_LUN_NAME[$VOL_UUID]}
+    if [ ! -e ${FUSE_DIR[${DEV_SERVER[$dev]}]}/${VOL_LUN_NAME[$VOL_UUID]} ]; then
+        failed "volume not exported"
+    fi
+done
+
+# Create root parcels on servers for a device on the other servers
+for d1 in ${NUVO_DIRS[*]}
+do
+    for dev in ${DEV_UUIDS[*]}
+    do
+        if [ $d1 != ${DEV_SERVER[$dev]} ] ; then
+            VOL_UUID=$( uuidgen )
+            ROOT_PARCEL_UUID=$( uuidgen )
+            REMOTE_VOL_UUIDS+=($VOL_UUID)
+            VOL_DEV_UUID[$VOL_UUID]=$dev
+
+            echo "Creating parcel volume with devices on remote node."
+            echo $NUVO_VM_FT_CMD -s ${NODE_CTRL[$d1]} create-parcel-volume -d $dev -v $VOL_UUID -p $ROOT_PARCEL_UUID
+            ROOT_PARCEL=$( $NUVO_VM_FT_CMD -s ${NODE_CTRL[$d1]} create-parcel-volume -d $dev -v $VOL_UUID -p $ROOT_PARCEL_UUID )
+
+            VOL_DEV_ROOT[$VOL_UUID]=$ROOT_PARCEL
+            VOL_SERVER[$VOL_UUID]=$d1
+
+            # following line for debug // making if a no op?
+            ROOT_PARCEL=$ROOT_PARCEL_UUID
+
+            if [ "$ROOT_PARCEL_UUID" != "$ROOT_PARCEL" ] ; then
+                failed "Root parcel UUID not expected"
+            fi
+        fi
+    done
+done
+
+# Attempt a duplicate root-parcel-uuid
+
+# this should fail
+if $LAST_CREATE_ROOT_CMD ; then
+        failed "Duplicate Root Parcel UUID should fail"
+fi
+
+# Now alloc parcels from other devices
+for vol in ${VOL_UUIDS[*]}
+do
+    server=${DEV_SERVER[${VOL_DEV_UUID[$vol]}]}
+    for dev in ${DEV_UUIDS[*]}
+    do
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server]} alloc-parcels -v $vol -d $dev -n 1
+    done
+done
+
+# unexport
+for vol in ${VOL_UUIDS[*]}
+do
+    dev=${VOL_DEV_UUID[$vol]}
+    server=${DEV_SERVER[$dev]}
+    ls -l ${FUSE_DIR[$server]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server]} unexport -v $vol -e ${VOL_LUN_NAME[$vol]}
+    if [ -e ${FUSE_DIR[$server]}/${VOL_LUN_NAME[$vol]} ]; then
+        failed "volume not unexported"
+    fi
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server]} export -v $vol -e ${VOL_LUN_NAME[$vol]}
+    if [ ! -e ${FUSE_DIR[$server]}/${VOL_LUN_NAME[$vol]} ]; then
+        failed "volume not exported"
+    fi
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server]} unexport -v $vol -e ${VOL_LUN_NAME[$vol]}
+    if [ -e ${FUSE_DIR[$server]}/${VOL_LUN_NAME[$vol]} ]; then
+        failed "volume not unexported"
+    fi
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server]} close-volume -v $vol
+done
+
+for vol in ${REMOTE_VOL_UUIDS[*]}
+do
+    server=${VOL_SERVER[$vol]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$server]} close-volume -v $vol
+done
+
+
+# Now lets use one of the volumes
+VOL=${VOL_UUIDS[0]}
+DEV=${VOL_DEV_UUID[$VOL]}
+SERVER=${DEV_SERVER[$DEV]}
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} open-parcel-volume -v $VOL -d $DEV -p ${VOL_DEV_ROOT[$VOL]}
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} export -v $VOL -e ${VOL_LUN_NAME[$VOL]}
+
+
+#####################################
+# Misaligned Writes and Reads
+#####################################
+
+NUVOVOL=${FUSE_DIR[$SERVER]}/${VOL_LUN_NAME[$VOL]}
+TEMPFILE=/tmp/t$$
+COPYFILE=/tmp/c$$
+RANDFILE=/dev/urandom
+
+# Build the reference file
+dd if=$RANDFILE of=$TEMPFILE bs=3072 count=4 2> /dev/null
+
+# Misalign Writes into the Nuvo Vol
+dd if=$TEMPFILE of=$NUVOVOL  bs=3072 count=4 oflag=direct conv=notrunc 2> /dev/null
+
+# Misalign Reads of the Nuvo Vol into a copy
+dd if=$NUVOVOL of=$COPYFILE ibs=3072 obs=3072 count=4 iflag=direct 2> /dev/null
+
+# Compare the read file against the reference file
+cmp $TEMPFILE $COPYFILE
+if [ $? -ne 0 ] ; then
+    failed "misaligned writes/reads"
+else
+    echo passed "misaligned writes/reads"
+fi
+
+dd if=$NUVOVOL of=$COPYFILE bs=12288 count=1 2> /dev/null
+cmp $TEMPFILE $COPYFILE
+if [ $? -ne 0 ] ; then
+    failed "misaligned writes aligned reads"
+else
+    echo passed "misaligned writes aligned reads"
+fi
+
+rm -f $TEMPFILE $COPYFILE
+
+###############################
+# Now on to Higher level tests
+###############################
+
+export MKE2FS_DEVICE_SECTSIZE=4096
+mkfs -t ext4 -b 4096 ${FUSE_DIR[$SERVER]}/${VOL_LUN_NAME[$VOL]}
+mkdir $SERVER/vol
+sudo mount ${FUSE_DIR[$SERVER]}/${VOL_LUN_NAME[$VOL]} $SERVER/vol
+if [ ! -d $SERVER/vol/lost+found ]; then
+    failed "No lost+found"
+fi
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} get-stats -r -d $DEV
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} get-stats -w -d $DEV
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} get-stats -w -p -d $DEV
+umount $SERVER/vol
+
+# Now let's have fun with bad commands
+RAND_NODE_UUID=$( uuidgen )
+RAND_DEV_UUID=$( uuidgen )
+RAND_DEV_PATH=$TEST_DIR/rand_dev
+RAND_VOL_UUID=$( uuidgen )
+RAND_PARCEL_UUID=$( uuidgen )
+truncate -s 1G $RAND_DEV_PATH
+echo ---- Now doing a bunch of commands that should fail ----
+
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} -v use-node-uuid -u bogus; then
+    failed "use of bad node uuid worked"
+fi
+
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} -v use-node-uuid -u $RAND_NODE_UUID; then
+    failed "use of different node uuid worked"
+fi
+
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} -v use-node-uuid -u ${NODE_UUID[$SERVER]}
+if [ $? -ne 0 ] ; then
+    failed "using the same node uuid didn't work"
+fi
+
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} node-location -n "Nope" -i "127.0.0.1" -p 1024; then
+    failed "node-location command succeeded with bad node uuid"
+fi
+
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} device-location -d "not device uuid" -n $RAND_NODE_UUID ; then
+    failed "device-location worked with bad device uuid"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} device-location -d $RAND_DEV_UUID -n "not node uuid" ; then
+    failed "device-location worked with bad node uuid"
+fi
+
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} format-device -d $RAND_DEV_PATH -u $RAND_DEV_UUID -p 4096003; then
+    failed "format-device worked with bad parcel_size"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} format-device -d $RAND_DEV_PATH -u "nuuid" -p 4096000; then
+    failed "format-device worked with bad node uuid"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} format-device -d $TEST_DIR/nofile -u $RAND_DEV_UUID -p 4096000; then
+    failed "format-device worked with bad device path"
+fi
+
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} use-device -d $RAND_DEV_PATH -u $RAND_DEV_UUID; then
+    failed "use-device worked with unformatted device"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} use-device -d $RAND_DEV_PATH -u "Boring"; then
+    failed "use-device worked with bad device uuid"
+fi
+
+# Volume is already exported
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} export -v $VOL -e ${VOL_LUN_NAME[$VOL]}; then
+    failed "export of exported volume succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} export -v $RAND_VOL_UUID -e "Harvey"; then
+    failed "export of nonexistent volume succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} export -v "Not a vol uuid" -e "Harvey"; then
+    failed "export of bad volume uuid succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} unexport -v $RAND_VOL_UUID -e "Harvey"; then
+    failed "unexport of nonexistent volume succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} unexport -v "Not a vol uuid" -e "Harvey"; then
+    failed "unexport of bad volume uuid succeeded"
+fi
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} unexport -v $VOL -e ${VOL_LUN_NAME[$VOL]}
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} unexport -v $VOL -e ${VOL_LUN_NAME[$VOL]}; then
+    failed "unexport of unexported volume succeeded"
+fi
+
+# Now let's use the VOL/DEV/SERVER from above to monkey around with this running volume.
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} alloc-parcels -v $VOL -d $RAND_DEV_UUID -n 1; then
+    failed "alloc-parcels from non-existent device succeed"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} alloc-parcels -v $VOL -d "bob" -n 1; then
+    failed "alloc-parcels from bad device uuid succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} open-parcel-volume -v $VOL -d $DEV -p ${VOL_DEV_ROOT[$VOL]}; then
+    failed "open-parcel-volume of open volume succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} open-parcel-volume -v $RAND_VOL_UUID -d $RAND_DEV_UUID -p $RAND_PARCEL_UUID; then
+    failed "open-parcel-volume of non-existent volume succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} open-parcel-volume -v "vol" -d $RAND_DEV_UUID -p $RAND_PARCEL_UUID; then
+    failed "open-parcel-volume of bad volume uuid succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} open-parcel-volume -v $RAND_VOL_UUID -d "dev" -p $RAND_PARCEL_UUID; then
+    failed "open-parcel-volume of bad device uuid succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} open-parcel-volume -v $RAND_VOL_UUID -d $RAND_DEV_UUID -p "parcel"; then
+    failed "open-parcel-volume of bad parcel uuid succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} get-stats -d $DEV; then
+    failed "get-stats without read or write succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} get-stats -r -d $RAND_DEV_UUID; then
+    failed "get-stats of random device uuid succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} get-stats -r; then
+    failed "get-stats without volume or device succeeded"
+fi
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} get-stats -r -v $VOL
+if [ $? -ne 0 ] ; then
+    failed "get-stats of volume failed"
+fi
+
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} close-volume -v $VOL
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} close-volume -v $VOL; then
+    failed "close-volume of closed volume succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} close-volume -v $RAND_VOL_UUID; then
+    failed "close-volume of nonexistent volume succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} close-volume -v "I'm not a volume uuid"; then
+    failed "close-volume of bad uuid succeeded"
+fi
+if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} close-volume -v vol; then
+    failed "close-volume of bad volume uuid succeeded"
+fi
+
+# now destroy the volumes
+for VOL in ${VOL_UUIDS[*]}
+do
+    DEV=${VOL_DEV_UUID[$VOL]}
+    SERVER=${DEV_SERVER[$DEV]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} destroy-parcel-volume -v $VOL -d $DEV -p ${VOL_DEV_ROOT[$VOL]}
+    if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} open-parcel-volume -v $VOL -d $DEV -p ${VOL_DEV_ROOT[$VOL]}; then
+        failed "open of destroyed volume failed"
+    fi
+done
+
+# now destroy the remote volumes
+for VOL in ${REMOTE_VOL_UUIDS[*]}
+do
+    DEV=${VOL_DEV_UUID[$VOL]}
+    SERVER=${VOL_SERVER[$VOL]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} destroy-parcel-volume -v $VOL -d $DEV -p ${VOL_DEV_ROOT[$VOL]}
+    if $NUVO_VM_FT_CMD -s ${NODE_CTRL[$SERVER]} open-parcel-volume -v $VOL -d $DEV -p ${VOL_DEV_ROOT[$VOL]}; then
+        failed "open of destroyed volume failed"
+    fi
+done

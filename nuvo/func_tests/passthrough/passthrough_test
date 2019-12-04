@@ -1,0 +1,146 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+echo "---------- STARTING PASSTHROUGH VOLUME FUNC TEST ----------"
+set -x
+set -e
+set -u
+
+# Pass in the nuvo command
+NUVO_VM_FT_CMD=$1
+# Point to the NUVO_CMD in this tree.
+NUVO_CMD="../../nuvo"
+EPHEM_CMD="../../../util/nuvo_ephemeral"
+
+function finish {
+    local lc="$BASH_COMMAND" rc=$?
+    set +e
+    set +x
+    echo "Cleaning Up"
+
+    echo Tearing down nuvo
+    umount $VOL_MNT
+    umount -v ${FUSE_DIR}/vol && echo unmounted ${FUSE_DIR}
+
+    $NUVO_VM_FT_CMD -s $SOCKET_NAME -v halt
+
+    wait ${FUSE_PID}
+    valgrind_status=$?
+    if [ $valgrind_status -eq 0 ]; then
+        echo "valgrind and $NUVO_CMD exited cleanly"
+    else
+        if [ $rc -eq 0 ]; then
+            rc=$valgrind_status
+            lc="valgrind"
+        fi
+    fi
+    rm -rf $TEST_DIR
+    if [ $rc -eq 0 ]; then
+        echo "-----------------------------------------"
+        echo "PASSTHROUGH VOLUME FUNC TEST"
+        echo SUCCESS
+        echo "-----------------------------------------"
+    else
+        echo "-----------------------------------------"
+        echo "PASSTHROUGH VOLUME FUNC TEST"
+        echo FAILED
+        echo COMMAND [$lc]
+        echo EXITED WITH CODE [$rc]
+        echo "-----------------------------------------"
+    fi
+    exit $rc
+}
+trap finish EXIT
+
+function failed() {
+    echo "ERROR - $1"
+    exit 1
+}
+
+# Create a directory
+TEST_DIR=`mktemp -d /tmp/nuvo_test.XXXXXXXXXXXXXXXX`
+echo "Created test directory $TEST_DIR"
+
+# Create FUSE directory
+FUSE_DIR="$TEST_DIR/fuse"
+mkdir $FUSE_DIR
+
+# Create directory to mount volume
+VOL_NAME="test_vol"
+VOL_MNT="$TEST_DIR/$VOL_NAME"
+mkdir $VOL_MNT
+
+# Create a data file to test in the volume
+TEST_DATA="$TEST_DIR/test_data"
+dd if=/dev/urandom of=$TEST_DATA bs=100K count=1
+
+# Backing store file name location for volume
+# Will be created by nuvo_vm
+DISK="$TEST_DIR/$VOL_NAME.backing"
+
+# Use a non-default api socket
+SOCKET_NAME="$TEST_DIR/nuvo_socket"
+
+
+NUVO_NODE_UUID=$( uuidgen )
+# Get an ephemeral port left in TIME_WAIT state soe
+# we can pass it into the fuse process and know we
+# are not having collisions
+NUVO_NODE_PORT=$( $EPHEM_CMD )
+
+# Start up the volume manager
+echo "Starting nuvo process"
+valgrind --error-exitcode=1 --leak-check=full --trace-children=no --gen-suppressions=all --suppressions=valgrind_supp.xml $NUVO_CMD -f -o allow_other $FUSE_DIR socket=$SOCKET_NAME nodeuuid=$NUVO_NODE_UUID port=$NUVO_NODE_PORT &
+FUSE_PID=$!
+
+for i in {1..30}
+do
+      if [ -e $SOCKET_NAME ]; then
+          break
+      fi
+      echo "Waiting for socket"
+    sleep 2
+done
+
+if [ ! -e "$SOCKET_NAME" ]; then
+    failed "Socket never came up"
+fi
+
+VOL_SERIES_UUID=$( uuidgen )
+$NUVO_VM_FT_CMD -s $SOCKET_NAME -v passthrough-volume -u=$VOL_SERIES_UUID -d $DISK -n $VOL_NAME -s 102400000 -c
+LUN_PATH=$FUSE_DIR/$VOL_NAME/vol
+mkfs.ext4 -b 4096 $LUN_PATH
+mount -v $LUN_PATH $VOL_MNT
+cp $TEST_DATA "$VOL_MNT/test_data"
+umount $VOL_MNT
+$NUVO_VM_FT_CMD -s $SOCKET_NAME -v unexport -v=$VOL_SERIES_UUID -e=$VOL_NAME
+if [ -e $LUN_PATH ]; then
+    failed "Unexported volume is still there"
+fi
+$NUVO_VM_FT_CMD -s $SOCKET_NAME -v export -v=$VOL_SERIES_UUID -e=$VOL_NAME
+if [ ! -e $LUN_PATH ]; then
+    failed "Unexported volume is not back"
+fi
+mount -v $LUN_PATH $VOL_MNT
+if cmp $TEST_DATA "$VOL_MNT/test_data"; then
+    echo "test data compared"
+else
+    failed "test data compare failed"
+fi
+umount $VOL_MNT
+$NUVO_VM_FT_CMD -s $SOCKET_NAME -v unexport -v=$VOL_SERIES_UUID -e=$VOL_NAME
+# Now cleanup in finish

@@ -1,0 +1,139 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="cache"
+
+source ./fake_cluster $1
+num_servers=1
+devices_per_server=2
+size_of_device=5G
+size_of_parcel=1073741824
+size_of_cache_device=2G
+num_cache_devices=2
+num_volumes=2
+
+function get_cache_device_stats() {
+    for cdev in ${CDEV_UUIDS[@]} ; do
+        fake_cluster_get_device_stats $VOL_SERVER $cdev
+    done
+}
+
+function get_cache_vol_stats() {
+    for vol in ${VOL_UUIDS[@]} ; do
+        fake_cluster_get_vol_stats $VOL_SERVER $vol
+    done
+}
+
+
+# setup the cluster
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+
+# now create two volumes
+# TODO add multiple volume io test
+for i in $(seq 0 $(($num_volumes - 1))) ; do
+    fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID 10737418240
+    VOL_UUID=${VOL_UUIDS[$i]}
+    #fake_cluster_grow_volume_percent $VOL_UUID 100
+done
+
+# only one volume will be used for io
+VOL_UUID=${VOL_UUIDS[$(($num_volumes - 1))]}
+fake_cluster_grow_volume_percent $VOL_UUID 60
+
+# create a cache from the cache devices
+CDEV_UUIDS=()
+total_cache=0
+for i in $(seq 0 $(($num_cache_devices - 1))) ; do
+    CDEV_UUIDS[$i]=$( uuidgen )
+    # use cache device returns two values. The size of the device and the allocation unit size.
+    out=$(fake_cluster_use_cache_device ${VOL_SERVER} ${CDEV_UUIDS[$i]} 2G | grep result | cut -d ':' -f 2 | xargs)
+    size_bytes=$(echo ${out} | cut -d ' ' -f1 | xargs)
+    alloc_unit_size=$(echo ${out} | cut -d ' ' -f2 | xargs)
+    ((total_cache+=$size_bytes))
+    echo "total_cache: ${total_cache} added: ${size_bytes} allocation unit: ${alloc_unit_size}"
+done
+
+#this test will start by assigning 1/4 of the cache to two volumes.
+#after the first write test, 1/2 of the cache will be assigned to the volume.
+#after the second write test, 3/4 cache will be assigned to the volume.
+#before starting the sequential read test the cache is shunk back to a 1/4.
+total_alloc_units=$(($total_cache / $alloc_unit_size))
+units=$(($total_alloc_units / 4))
+vol_cache_alloc_size=$(($units * $alloc_unit_size))
+
+# This tests that cache can be assigned to more than one volume
+for i in $(seq 0 $(($num_volumes - 1))) ; do
+    VOL_UUID=${VOL_UUIDS[$i]}
+    fake_cluster_alloc_cache_to_volume $VOL_UUID $vol_cache_alloc_size
+    fake_cluster_export_active $VOL_UUID
+done
+
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+VOL_UUID=${VOL_UUIDS[$(($num_volumes - 1))]}
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+
+rand_seed=$RANDOM
+
+# write
+fio --name=write --rw=write --size=128M --bs=1M --iodepth=64 --direct=1 --verify=crc32c --verify_fatal=1 --randrepeat=1 --refill_buffers --end_fsync=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL
+get_cache_vol_stats
+get_cache_device_stats
+vol_cache_alloc_size=$(($units * $alloc_unit_size * 2))
+fake_cluster_alloc_cache_to_volume $VOL_UUID $vol_cache_alloc_size
+
+# rand write
+fio --name=randwrite --rw=randwrite --size=128M --bs=4K --iodepth=128 --direct=1 --verify=crc32c --verify_fatal=1 --randrepeat=1 --refill_buffers --end_fsync=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL
+get_cache_vol_stats
+get_cache_device_stats
+
+vol_cache_alloc_size=$(($units * $alloc_unit_size * 3))
+fake_cluster_alloc_cache_to_volume $VOL_UUID $vol_cache_alloc_size
+
+#rand read write
+fio --name=randrw --rw=randrw --size=128M --bs=4K --iodepth=1 --direct=1 --verify=crc32c --verify_fatal=1 --randrepeat=1 --refill_buffers --end_fsync=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL
+get_cache_vol_stats
+get_cache_device_stats
+
+# sequential write
+fio --name=seqwrite --rw=write --size=128M --bs=4K --iodepth=1 --direct=1 --verify=crc32c --verify_fatal=1 --randrepeat=1 --refill_buffers --end_fsync=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL
+get_cache_vol_stats
+get_cache_device_stats
+
+vol_cache_alloc_size=$(($units * $alloc_unit_size))
+fake_cluster_alloc_cache_to_volume $VOL_UUID $vol_cache_alloc_size
+
+#sequential read. verification depends on the previous sequential write test.
+fio --name=seqread --rw=read --time_based --runtime=60 --size=128M --bs=4K --iodepth=1 --direct=1 --verify=crc32c --verify_fatal=1 --randrepeat=1 --refill_buffers --ioengine=libaio -group_reporting --filename=$NUVOVOL
+get_cache_vol_stats
+get_cache_device_stats
+
+# rand read
+fio --name=randread --rw=randread --time_based --runtime=60 --size=128M --bs=4K --iodepth=1 --direct=1 --numjobs=4 --verify=crc32c --verify_fatal=1 --randrepeat=1 --refill_buffers --ioengine=libaio -group_reporting --filename=$NUVOVOL
+get_cache_vol_stats
+get_cache_device_stats
+
+# Now create a file system
+mkfs -t ext4 -b 4096 $NUVOVOL
+fake_cluster_mount_lun $VOL_UUID
+fio --name=write --rw=write --size=64M --ioengine=libaio --randrepeat=1 --iodepth=1 --bs=128K --direct=1 --numjobs=1 --end_fsync=1 --filename=${LUN_MOUNT_POINT[$VOL_UUID]}/fio_test
+fio --name=read --rw=read --size=64M --ioengine=libaio --randrepeat=1 --iodepth=1 --bs=128K --direct=1 --numjobs=1 --filename=${LUN_MOUNT_POINT[$VOL_UUID]}/fio_test
+get_cache_vol_stats
+get_cache_device_stats
+# cluster tear-down is handled in finish

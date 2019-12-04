@@ -1,0 +1,100 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="BAD ORDER"
+
+# setup the cluster - a small cluster with small devices for example.
+source ./fake_cluster $1
+
+fake_cluster_configure_node $TEST_DIR/1
+fake_cluster_launch_node $TEST_DIR/1 false
+
+######################
+# Bad Order Checking
+######################
+SOCKET=$NUVO_DIRS[0]/nuvo_ctrl
+
+if $NUVO_VM_FT_CMD -s $SOCKET get-stats -r -d $( uuidgen ); then
+    fake_cluster_failed "get-stats should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET -v format-device -p 102400000 -d $( uuidgen ) -u=$( uuidgen ); then
+    fake_cluster_failed "format-device should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET -v use-device -d $( uuidgen ) -u=$( uuidgen ); then
+    fake_cluster_failed "use-device should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET -v node-location -n $( uuidgen ) -i "127.0.0.1" -p 1000; then
+    fake_cluster_failed "node-location should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET -v device-location -d $( uuidgen ) -n $( uuidgen ); then
+    fake_cluster_failed "device-location should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET export -v $( uuidgen ) -e name; then
+    fake_cluster_failed "export should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET unexport -v $( uuidgen ) -e name; then
+    fake_cluster_failed "unexport should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET create-volume -d $( uuidgen ) -v $( uuidgen ) -p $( uuidgen ) -s 102400000; then
+    fake_cluster_failed "create-volume should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET open-volume -d $( uuidgen ) -v $( uuidgen ) -p $( uuidgen ); then
+    fake_cluster_failed "open-volume should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET close-volume -v $( uuidgen ); then
+    fake_cluster_failed "close-volume should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET destroy-volume -d $( uuidgen ) -v $( uuidgen ) -p $( uuidgen ); then
+    fake_cluster_failed "destroy-volume should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET alloc-parcels -d $( uuidgen ) -v $( uuidgen ) -n 1; then
+    fake_cluster_failed "alloc-parcels should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET manifest -v $( uuidgen ) -f /tmp/f$$; then
+    fake_cluster_failed "manifest should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET create-pit -v $( uuidgen ) -p $( uuidgen ); then
+    fake_cluster_failed "create-pit should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET delete-pit -v $( uuidgen ) -p $( uuidgen ); then
+    fake_cluster_failed "delete-pit should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET list-pits -v $( uuidgen ); then
+    fake_cluster_failed "list-pits should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET pause-io -v $( uuidgen ); then
+    fake_cluster_failed "pause-io should have fake_cluster_failed before use-node-uuid but succeeded"
+fi
+
+if $NUVO_VM_FT_CMD -s $SOCKET resume-io -v $( uuidgen ); then
+    fake_cluster_failed "resume-io should have fake_cluster_failed before use-node-uuid but succeeded"
+fi

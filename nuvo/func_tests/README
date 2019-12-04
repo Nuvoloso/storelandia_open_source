@@ -1,0 +1,52 @@
+Copyright 2019 Tad Lebeck
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Putting this here so it can remain forever unread and everyone can
+skip over it and then wonder whynthis information is not documented
+anywhere.
+
+All of the functional tests are run through one of two
+scripts: run_extended_func_tests and run_func_test.
+
+These share a common setup of func_tests_common.
+This script gets the nuvo_vm and the copy command needed to run the
+test and sets up the variables that control whether the nuvo process
+will be run under gdb, valgrind or valgrind/callgrind.
+
+To get the commands, the script first looks to see if NUVO_VM and COPY_VM
+have been defined.  If so it uses them.  If they are not defined it will
+attempt to find the command in NUVO_FUNC_KONTROLLER, in
+~/go/src/github.com/Nuvoloso/kontroller/deploy/bin or form jenkins using
+JENKINS_CRED.   If it cannot find either command in any way it gives up.
+
+Once it has found the commands it copies them into a tmp directory.
+If commands have been copied from jenkins or NUVO_FUNC_KONTROLLER, then
+this will run check_proto to make sure the go and C code nuvo.proto matches.
+
+The code checks to see if NUVO_FUNC_TEST_TOOL is set.  Valid values are:
+    * "valgrind" - Run nuvo under vagrind.
+    * "callgrind" - Run nuvo under callgrind.  Run callgrind_annotate on file left in /tmp
+    * "profile" - Run nuvo_gperftools with profiling. Run google_pprof on file left in /tmp
+    * "gdb" - Sets NUVO_WAIT_FOR_GDB and makes nuvo wait for gdb to start.
+    * "default" - (or unset) just runs nuvo.
+
+If you have NUVO_FUNC_TEST_TOOL set, you probably want to comment out all but
+one test.
+
+If NUVO_WAIT_FOR_GDB=true (set when NUVO_FUNC_TEST_TOOL=gdb), then nuvo processes
+started will spin waiting for the user to connect gdb and set the obvious variable
+to allow them to continue.  The functional tests that run under fake_cluster will
+wait properly.  Others will not.   If that bothers you, fix them.
+
+For those tests not running under fake_cluster, the best solution is to move
+them to fake_cluster.

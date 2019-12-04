@@ -1,0 +1,68 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="MISALIGNED IO"
+
+# setup the cluster - a small cluster with small devices for example.
+source ./fake_cluster $1
+num_servers=1
+devices_per_server=2
+size_of_device=1G
+size_of_parcel=102400000
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+# now create and use a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID 1024000000
+VOL_UUID=${VOL_UUIDS[0]}
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+TEMPFILE=/tmp/t$$
+COPYFILE=/tmp/c$$
+RANDFILE=/dev/urandom
+
+# Build the reference file
+dd if=$RANDFILE of=$TEMPFILE bs=3072 count=4 2> /dev/null
+
+# Misalign Writes into the Nuvo Vol
+dd if=$TEMPFILE of=$NUVOVOL  bs=3072 count=4 oflag=direct conv=notrunc 2> /dev/null
+
+# Misalign Reads of the Nuvo Vol into a copy
+dd if=$NUVOVOL of=$COPYFILE ibs=3072 obs=3072 count=4 iflag=direct 2> /dev/null
+
+# Compare the read file against the reference file
+cmp $TEMPFILE $COPYFILE
+if [ $? -ne 0 ] ; then
+    failed "misaligned writes/reads"
+else
+    echo passed "misaligned writes/reads"
+fi
+
+dd if=$NUVOVOL of=$COPYFILE bs=12288 count=1 2> /dev/null
+cmp $TEMPFILE $COPYFILE
+if [ $? -ne 0 ] ; then
+    failed "misaligned writes aligned reads"
+else
+    echo passed "misaligned writes aligned reads"
+fi
+
+rm -f $TEMPFILE $COPYFILE

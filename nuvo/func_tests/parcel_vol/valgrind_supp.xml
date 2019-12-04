@@ -1,0 +1,39 @@
+{
+   <FixLookupJKE>
+   Memcheck:Param
+   writev(vector[...])
+   obj:/lib/x86_64-linux-gnu/libc-2.24.so
+   fun:fuse_send_msg
+   fun:fuse_send_reply_iov_nofree
+   fun:send_reply_iov
+   fun:send_reply.constprop.11
+   fun:send_reply_ok
+   fun:fuse_reply_entry
+   fun:nuvo_lookup_int
+   fun:nuvo_lookup
+   fun:nuvo_fs_lookup
+   fun:fuse_session_process_buf_int
+   fun:fuse_do_work
+   fun:start_thread
+   fun:clone
+}
+
+{
+   <FixLookupJKE2>
+   Memcheck:Param
+   writev(vector[...])
+   fun:writev
+   fun:fuse_send_msg
+   fun:fuse_send_reply_iov_nofree
+   fun:send_reply_iov
+   fun:send_reply.constprop.11
+   fun:send_reply_ok
+   fun:fuse_reply_entry
+   fun:nuvo_lookup_int
+   fun:nuvo_lookup
+   fun:nuvo_fs_lookup
+   fun:fuse_session_process_buf_int
+   fun:fuse_do_work
+   fun:start_thread
+   fun:clone
+}

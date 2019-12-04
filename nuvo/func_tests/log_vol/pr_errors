@@ -1,0 +1,332 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="PR ERRORS"
+
+# Pass in the nuvo command
+if [ "$#" -ne 3 ] ; then
+  echo "USAGE: `basename $0` <nuvo_vm location> <skip_half_tests (1|0)> <num_test_loops>"
+  echo "EXAMPLE: `basename $0` $NUVO_VM_FT_CMD 1 2"
+  exit 1
+fi
+
+NUVO_VM=$1
+# Can cut run time approx in half by setting SKIP_HALF_TESTS=1
+SKIP_HALF_TESTS=$2
+# Number of iterations to run the test
+NUM_TEST_LOOPS=$3
+
+num_servers=3
+devices_per_server=1
+size_of_device=2G
+size_of_parcel=$(expr 256 \* 1024 \* 1024)
+size_of_lun=$(expr 1024 \* 1024 \* 1024)
+
+# setup the cluster
+source ./fake_cluster $NUVO_VM
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+# Config:
+# Node A, Node B, Node C
+# Dev  A, Dev  B, Dev  C
+# Each node has one device (Dev A is attached to Node A, etc.)
+# Volume 1 - Exported on Node A; Uses Dev B
+# Volume 2 - Exported on Node A; Uses Dev C
+# Volume 3 - Exported on Node A; Uses Dev A (not currently used)
+
+# The root parcel is located on a device on the other node
+DEVICE_UUID_LOCAL=${DEV_UUIDS[0]}
+DEVICE_UUID_REMOTE1=${DEV_UUIDS[1]}
+DEVICE_UUID_REMOTE2=${DEV_UUIDS[2]}
+VOL_SERVER_LOCAL=${DEV_SERVER[$DEVICE_UUID_LOCAL]}
+VOL_SERVER_REMOTE1=${DEV_SERVER[$DEVICE_UUID_REMOTE1]}
+VOL_SERVER_REMOTE2=${DEV_SERVER[$DEVICE_UUID_REMOTE2]}
+NODE_UUID_LOCAL=${DEV_NODE[$DEVICE_UUID_LOCAL]}
+NODE_UUID_REMOTE1=${DEV_NODE[$DEVICE_UUID_REMOTE1]}
+NODE_UUID_REMOTE2=${DEV_NODE[$DEVICE_UUID_REMOTE2]}
+
+# Create volume using device on remote node
+fake_cluster_create_vol $VOL_SERVER_LOCAL $DEVICE_UUID_REMOTE1 $size_of_lun
+VOL_UUID_REMOTE1=${VOL_UUIDS[0]}
+
+# add parcels from remote device to volume
+fake_cluster_grow_volume_on_device $VOL_UUID_REMOTE1 $DEVICE_UUID_REMOTE1
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID_REMOTE1
+
+# Create volume 2 using device on remote node
+fake_cluster_create_vol $VOL_SERVER_LOCAL $DEVICE_UUID_REMOTE2 $size_of_lun
+VOL_UUID_REMOTE2=${VOL_UUIDS[1]}
+
+# add parcels from remote device to volume
+fake_cluster_grow_volume_on_device $VOL_UUID_REMOTE2 $DEVICE_UUID_REMOTE2
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID_REMOTE2
+
+# Uncomment for a local volume setup
+## Create volume 3 using device on local node
+#fake_cluster_create_vol $VOL_SERVER_LOCAL $DEVICE_UUID_LOCAL $size_of_lun
+#VOL_UUID_LOCAL=${VOL_UUIDS[2]}
+#
+## add parcels from remote device to volume
+#fake_cluster_grow_volume_on_device $VOL_UUID_LOCAL $DEVICE_UUID_LOCAL
+#
+## export the active lun
+#fake_cluster_export_active $VOL_UUID_LOCAL
+
+
+# Increase pr log level on client node during functional test
+fake_cluster_log_level 1 pr 50
+fake_cluster_log_level 2 pr 50
+fake_cluster_log_level 3 pr 50
+
+
+# ----------------------------------------------------------------------
+# Test functions
+# ----------------------------------------------------------------------
+
+function inject_errors_with_fio() {
+  local num_connections=${1:-1}
+  local repeat_err_cnt=${2:-1}
+  local skip_odds=${3:-false}
+  local skip_evens=${4:-false}
+
+  local local_node=$NODE_UUID_LOCAL
+  local remote_node=$NODE_UUID_REMOTE1
+
+  local fio_pid_node2;
+
+  if ((num_connections == 2)) ; then
+    echo "Testing multiple connection failures"
+    # Fault Injection uses a "0" node uuid as a wildcard that matches all nodes.
+    local_node=0
+    remote_node=0
+  fi
+
+  # Step through all of the socket error injection points
+  # Client Side error injection
+  MIN_CLIENT_PR_ERRORS=3
+  MAX_CLIENT_PR_ERRORS=6
+  for i in $(seq $MIN_CLIENT_PR_ERRORS $MAX_CLIENT_PR_ERRORS)
+  do
+    # Can skip either odd or even tests to reduce test runtime.
+    if (($i % 2 == 0)) ; then
+      if ($skip_evens = true) ; then continue; fi
+    else
+      if ($skip_odds = true) ; then continue; fi
+    fi
+
+    echo "Fault Injection (Client Side) $i"
+    fake_cluster_debug_trigger 1 debug-trigger --trigger "pr_error" --node ${remote_node} --error-type ${i} --return-code -10 --repeat-cnt ${repeat_err_cnt} --skip-cnt 50
+
+    # Do some Remote I/O with the test point enabled
+    echo "$FIO_CMD_OPS"
+
+    if ((num_connections == 2)); then
+      echo "$FIO_CMD_OPS_ASYNC_F2"
+      eval "$FIO_CMD_OPS_ASYNC_F2"
+      fio_pid_node2=$!
+    fi
+
+    eval "$FIO_CMD_OPS"
+
+    if ((num_connections == 2)); then
+      fake_cluster_debug_trigger 1 debug-trigger --trigger "pr_log_stats"
+      echo "Waiting on FIO PID: $fio_pid_node2"
+      wait $fio_pid_node2
+    fi
+
+  done
+
+  # clear any remaining pr client/server errors.
+  FI_ERR_TYPE=6
+  fake_cluster_debug_trigger 1 debug-trigger --trigger "pr_error" --node ${local_node} --error-type ${FI_ERR_TYPE} --return-code -10 --repeat-cnt 0 --skip-cnt 50
+
+  # Server Side error injection
+  MIN_SERVER_PR_ERRORS=7
+  MAX_SERVER_PR_ERRORS=10
+  for i in $(seq $MIN_SERVER_PR_ERRORS $MAX_SERVER_PR_ERRORS)
+  do
+    # Can skip either odd or even tests to reduce test runtime.
+    if (($i % 2 == 0)) ; then
+      if ($skip_evens = true) ; then continue; fi
+    else
+      if ($skip_odds = true) ; then continue; fi
+    fi
+
+    echo "Fault Injection (Server Side) $i"
+    fake_cluster_debug_trigger 2 debug-trigger --trigger "pr_error" --node ${local_node} --error-type ${i} --return-code -10 --repeat-cnt ${repeat_err_cnt} --skip-cnt 50
+    # Do some Remote I/O with the test point enabled
+    echo "$FIO_CMD_OPS"
+    eval "$FIO_CMD_OPS"
+  done
+
+  # clear any remaining pr server errors.
+  FI_ERR_TYPE=7
+  fake_cluster_debug_trigger 2 debug-trigger --trigger "pr_error" --node ${local_node} --error-type ${FI_ERR_TYPE} --return-code -10 --repeat-cnt 0 --skip-cnt 50
+
+}
+
+
+# ----------------------------------------------------------------------
+# Test starts here
+# ----------------------------------------------------------------------
+
+
+FIO_FILENAME1=$(fake_cluster_active_path $VOL_UUID_REMOTE1)
+FIO_FILENAME2=$(fake_cluster_active_path $VOL_UUID_REMOTE2)
+FIO_RUNTIME=2
+FIO_TOTAL_IO_SIZE=10M
+FIO_TOTAL_F2_IO_SIZE=20M
+
+FIO_CMD_OPS='fio --name=test --rw=randwrite --size=$size_of_lun --rwmixread=20 --rwmixwrite=80 --io_size=$FIO_TOTAL_IO_SIZE --ioengine=libaio --iodepth=4 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$FIO_FILENAME1 --randseed $RANDOM --verify=crc32c --verify_fatal=1'
+# FIO async uses file 2 (vol2), the other FIO calls use file 1 (vol1)
+FIO_CMD_OPS_ASYNC_F2='fio --name=test --rw=randwrite --size=$size_of_lun --rwmixread=20 --rwmixwrite=80 --io_size=$FIO_TOTAL_F2_IO_SIZE --ioengine=libaio --iodepth=4 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$FIO_FILENAME2 --randseed $RANDOM --verify=crc32c --verify_fatal=1 &'
+# fio needs to run long enough to recover from error and still send ops.
+FIO_CMD_TIME='fio --name=test --rw=randwrite --size=$size_of_lun --rwmixread=20 --rwmixwrite=80 --runtime=$FIO_RUNTIME --time_based=1 --io_size=$FIO_TOTAL_IO_SIZE --ioengine=libaio --iodepth=4 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$FIO_FILENAME1 --randseed $RANDOM --verify=crc32c --verify_fatal=1'
+FIO_CMD_ONE_OP='fio --name=test --rw=randwrite --size=$size_of_lun --rwmixread=0 --rwmixwrite=100 --io_size=4K --ioengine=libaio --iodepth=1 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$FIO_FILENAME1 --randseed $RANDOM --verify=crc32c --verify_fatal=1'
+
+for test_round in $(seq 1 $NUM_TEST_LOOPS)
+do
+  set +x
+  if [ "$NUM_TEST_LOOPS" -ne 1 ] ; then
+    echo   ""
+    echo   "*****************************"
+    echo   " Test round $test_round"
+    echo   "*****************************"
+    echo   ""
+  fi
+
+  echo   "--------------------------------"
+  echo   " Remote I/O Test without errors"
+  echo   "--------------------------------"
+
+  # Do some Remote I/O with no test points enabled
+  echo "$FIO_CMD_OPS_ASYNC_F2"
+  echo "$FIO_CMD_OPS"
+  eval "$FIO_CMD_OPS_ASYNC_F2"
+  FIO_ASYNC_PID=$!
+  eval "$FIO_CMD_OPS"
+
+  echo "Waiting on FIO PID: $FIO_ASYNC_PID"
+  wait $FIO_ASYNC_PID
+
+  echo   ""
+  echo   "--------------------------------"
+  echo   " Remote I/O with Fault Injection"
+  echo   "--------------------------------"
+  echo   ""
+  echo   "--------------------------------"
+  echo   " FI Phase 1 - Single Error      "
+  echo   "--------------------------------"
+  echo   ""
+
+
+  # Let fio run for 4 seconds during each fault injection
+  #FIO_RUNTIME=4
+
+  echo "Fault Injection - TEST_FI_PR_PDEF_GET (2)"
+  FI_ERR_TYPE=2
+  # Inject error when getting parcel def.
+  fake_cluster_debug_trigger 1 debug-trigger --trigger "pr_error" --error-type ${FI_ERR_TYPE} --return-code -10 --repeat-cnt 1 --skip-cnt 50
+  # Do some Remote I/O with the test point enabled
+  #echo "$FIO_CMD_OPS"
+  #eval "$FIO_CMD_OPS"
+
+  # Call main function for error injection with fio.
+  # params: node 1, inject 1 error, skip even errors, test odd errors
+  inject_errors_with_fio 1 1 true false
+
+  echo   ""
+  echo   "-------------------------------------"
+  echo   " FI Phase 2 - Errors during recovery "
+  echo   "-------------------------------------"
+  echo   ""
+
+  inject_errors_with_fio 1 10 false true
+
+
+  echo   ""
+  echo   "-------------------------------------"
+  echo   " FI Phase 3 - Dual Connection failures, with errors during recovery "
+  echo   "-------------------------------------"
+  echo   ""
+
+  inject_errors_with_fio 2 20 true false
+
+
+#End of test loop repeat
+done
+
+
+set +x
+echo   ""
+echo   "-----------------------------"
+echo   " Device stats"
+echo   "-----------------------------"
+echo   " -- Remote Stats (should see I/O) --"
+echo   " Remote Write Stats"
+echo   "Device B (Node B):"
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER_REMOTE1]} get-stats -w -d ${DEVICE_UUID_REMOTE1}
+echo   "Device C (Node C):"
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER_REMOTE2]} get-stats -w -d ${DEVICE_UUID_REMOTE2}
+echo   " Remote Read Stats"
+echo   "Device B (Node B):"
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER_REMOTE1]} get-stats -r -d ${DEVICE_UUID_REMOTE1}
+echo   "Device C (Node C):"
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER_REMOTE2]} get-stats -r -d ${DEVICE_UUID_REMOTE2}
+echo   ""
+echo   " -- Local Stats (should not see I/O) --"
+echo   " Local Write Stats "
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER_LOCAL]} get-stats -w -d ${DEVICE_UUID_LOCAL}
+echo   " Local Read Stats"
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER_LOCAL]} get-stats -r -d ${DEVICE_UUID_LOCAL}
+echo   ""
+
+# Test device close apis
+echo   ""
+echo   "-----------------------------"
+echo   " Device close API test"
+echo   "-----------------------------"
+echo   ""
+set -x
+
+# Close a device with no parcels in use
+fake_cluster_close_device $DEVICE_UUID_LOCAL
+# Close a device with parcels in use (should fail)
+fake_cluster_close_device $DEVICE_UUID_REMOTE1 || true
+# Close a device on a remote node (should fail)
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER_LOCAL]} close-device -u=$DEVICE_UUID_REMOTE2 || true
+# Do device status on removed device, Should not return any stats
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER_LOCAL]} get-stats -w -d ${DEVICE_UUID_LOCAL} || true
+# Normal device close will happen at shutdown.
+
+
+# Drop the pr log level back to default
+fake_cluster_log_level 1 pr 0
+fake_cluster_log_level 2 pr 0
+fake_cluster_log_level 3 pr 0
+
+fake_cluster_debug_trigger 1 debug-trigger --trigger "pr_log_stats"
+fake_cluster_debug_trigger 2 debug-trigger --trigger "pr_log_stats"
+fake_cluster_debug_trigger 3 debug-trigger --trigger "pr_log_stats"
+
+sleep 2
+
+# cluster tear-down is handled in fake_cluster_finish()

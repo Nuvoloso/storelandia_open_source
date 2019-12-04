@@ -1,0 +1,154 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="cache_hint"
+
+# Basic sanity test on the is_user flag (and indirectly the cache hint)
+# through stats. Reads from non-active LUN are tagged with no-cache flag
+# in the same way they are tagged as non-user I/O (for use by stats).
+# Verify reads from non-active LUN do not change stats.
+
+source ./fake_cluster $1
+num_servers=1
+devices_per_server=1
+size_of_device=5G
+size_of_parcel=1073741824
+size_of_cache_device=2G
+num_cache_devices=1
+num_volumes=1
+
+# Hard coded position of fields in cache statistics
+CACHE_READ_COUNT=33
+CACHE_READ_HIT_COUNT=38
+CACHE_READ_MISS_COUNT=43
+CACHE_WRITE_COUNT=51
+
+function get_cache_user_stat() {
+    local pos=$1
+    local line=$(fake_cluster_get_vol_stats ${VOL_SERVER} $VOL_UUID)
+    echo "$(echo $(echo $line | cut -d ' ' -f $pos) | cut -d',' -f1)"
+}
+
+# setup the cluster
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+# now create a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID 10737418240
+VOL_UUID=${VOL_UUIDS[0]}
+
+# add parcels to the volume
+fake_cluster_grow_volume_percent $VOL_UUID 100
+
+# create a cache device
+CDEV_UUID=$(uuidgen)
+
+# use cache device returns two values. The size of the device and the allocation unit size.
+out=$(fake_cluster_use_cache_device ${VOL_SERVER} $CDEV_UUID 2G | grep result | cut -d ':' -f 2 | xargs)
+size_bytes=$(echo ${out} | cut -d ' ' -f1 | xargs)
+alloc_unit_size=$(echo ${out} | cut -d ' ' -f2 | xargs)
+echo "total_cache: ${size_bytes} allocation unit: ${alloc_unit_size}"
+
+# assign cache to volume
+fake_cluster_alloc_cache_to_volume $VOL_UUID $size_bytes
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+
+prev_cache_write_count=$(get_cache_user_stat $CACHE_WRITE_COUNT)
+
+# ----------------------------------------------
+# write some data
+fio --name=seqwrite --rw=write --size=24M --bs=4K --iodepth=1 --direct=1 --randrepeat=1 --refill_buffers --end_fsync=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL
+
+cache_write_count=$(get_cache_user_stat $CACHE_WRITE_COUNT)
+cache_read_hit_count=$(get_cache_user_stat $CACHE_READ_HIT_COUNT)
+
+# cache read hit count (user) should be zero
+if (($cache_read_hit_count != 0))
+then
+    printf "cache read hit count should be zero\n"
+    exit 1
+fi
+
+# there should be cache writes
+if ((cache_write_count == prev_cache_write_count));
+then
+    printf "cache write stat verification failed\n"
+    exit 1
+fi
+
+# Create a pit
+PIT_UUID=$(uuidgen)
+fake_cluster_pause_io $VOL_UUID
+fake_cluster_create_pit $VOL_UUID $PIT_UUID
+fake_cluster_resume_io $VOL_UUID
+fake_cluster_export_pit $VOL_UUID $PIT_UUID
+pit_name=$(fake_cluster_pit_path $PIT_UUID)
+
+# save current stats
+prev_cache_write_count=$(get_cache_user_stat $CACHE_WRITE_COUNT)
+prev_cache_read_count=$(get_cache_user_stat $CACHE_READ_COUNT)
+prev_cache_read_hit_count=$(get_cache_user_stat $CACHE_READ_HIT_COUNT)
+prev_cache_read_miss_count=$(get_cache_user_stat $CACHE_READ_MISS_COUNT)
+
+# do some read from active lun
+fio --name=seqread --rw=read --size=24M --bs=4K --iodepth=1 --direct=1 --randrepeat=1 --refill_buffers --ioengine=libaio -group_reporting --filename=$NUVOVOL
+
+# get new stats
+cache_write_count=$(get_cache_user_stat $CACHE_WRITE_COUNT)
+cache_read_count=$(get_cache_user_stat $CACHE_READ_COUNT)
+cache_read_hit_count=$(get_cache_user_stat $CACHE_READ_HIT_COUNT)
+cache_read_miss_count=$(get_cache_user_stat $CACHE_READ_MISS_COUNT)
+
+# all the user stats should have changed
+if ((cache_read_count == prev_cache_read_count)) ||
+   ((cache_read_hit_count == prev_cache_read_hit_count)) ||
+   ((cache_read_miss_count == prev_cache_read_miss_count));
+then
+    printf "cache stats verification failed\n"
+    exit 1
+fi
+
+# save current stats
+prev_cache_write_count=$(get_cache_user_stat $CACHE_WRITE_COUNT)
+prev_cache_read_count=$(get_cache_user_stat $CACHE_READ_COUNT)
+prev_cache_read_hit_count=$(get_cache_user_stat $CACHE_READ_HIT_COUNT)
+prev_cache_read_miss_count=$(get_cache_user_stat $CACHE_READ_MISS_COUNT)
+
+# read from PIT
+fio --name=seqread --rw=read --size=24M --bs=4K --iodepth=1 --direct=1 --randrepeat=1 --refill_buffers --ioengine=libaio -group_reporting --filename=$pit_name
+
+# get new stats
+cache_write_count=$(get_cache_user_stat $CACHE_WRITE_COUNT)
+cache_read_count=$(get_cache_user_stat $CACHE_READ_COUNT)
+cache_read_hit_count=$(get_cache_user_stat $CACHE_READ_HIT_COUNT)
+cache_read_miss_count=$(get_cache_user_stat $CACHE_READ_MISS_COUNT)
+
+# None of the user stats should have changed
+if ((cache_write_count != prev_cache_write_count)) ||
+   ((cache_read_count != prev_cache_read_count)) ||
+   ((cache_read_hit_count != prev_cache_read_hit_count))
+   ((cache_read_miss_count != prev_cache_read_miss_count));
+then
+    printf "cache stats verification failed\n"
+    exit 1
+fi
+
+fake_cluster_unexport_pit $PIT_UUID
+

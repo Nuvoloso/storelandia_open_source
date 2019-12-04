@@ -1,0 +1,211 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="differ"
+COPY=${2:-"NONE"}
+SCALE=${3:-100}
+
+# setup the cluster - a small cluster with small devices for example.
+source ./fake_cluster $1
+num_servers=1
+devices_per_server=2
+size_of_device=1G
+size_of_parcel=102400000
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+# now create and use a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID $(( $SCALE * 1024 * 1024 ))
+VOL_UUID=${VOL_UUIDS[0]}
+
+# add parcels to the volume
+fake_cluster_grow_volume_percent $VOL_UUID 100
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+
+# protection store pass phrase
+pass_phrase="Password"
+
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+SOCKET=${NODE_CTRL[$VOL_SERVER]}
+
+set +x
+echo "#####################"
+echo "# Differ Test Start #"
+echo "#####################"
+set -x
+
+function do_copy {
+    local args=$1
+    local results=/tmp/results.$$
+
+    if [ "$COPY" != "NONE" ] ; then
+        sudo $COPY -args $args -results $results
+    else
+        set +x ; echo "==== COPY PROGRAM NOT PROVIDED, SKIPPING COPY ====" > $results; set -x
+    fi
+    cat $results
+    rm $results
+    if [ -f /tmp/progress.$$ ] ; then
+        rm /tmp/progress.$$
+    fi
+}
+
+# Build the argument JSON for the copy program
+# file vol mountpoint base incr socket
+function make_backup_copy_args {
+    set +x
+    local arg_fn=$1
+    local vol_uuid=$2
+    local mount_point=$3
+    local base_snap=$4
+    local incr_snap=$5
+    local socket=$6
+    local ps_dir=$7
+
+    echo "{" > $arg_fn
+    echo "  \"SrcType\": \"Nuvo\"," >> $arg_fn
+    echo "  \"SrcArgs\": {" >> $arg_fn
+    echo "    \"Nuvo\": {" >> $arg_fn
+    echo "      \"VolumeUUID\": \"${vol_uuid}\"," >> $arg_fn
+    echo "      \"FileName\": \"${mount_point}\"," >> $arg_fn
+    echo "      \"BaseSnapUUID\": \"${base_snap}\"," >> $arg_fn
+    echo "      \"IncrSnapUUID\": \"${incr_snap}\"," >> $arg_fn
+    echo "      \"NuvoSocket\": \"${socket}\"" >> $arg_fn
+    echo "    }" >> $arg_fn
+    echo "  }," >> $arg_fn
+    echo "  \"DstType\": \"Dir\"," >> $arg_fn
+    echo "  \"DstArgs\": {" >> $arg_fn
+    echo "    \"Dir\": {" >> $arg_fn
+    echo "      \"Directory\": \"${ps_dir}\"," >> $arg_fn
+    echo "      \"Domain\": \"PS\"," >> $arg_fn
+    echo "      \"Base\": \"${base_snap}\"," >> $arg_fn
+    echo "      \"Incr\": \"${incr_snap}\"," >> $arg_fn
+    echo "      \"PassPhrase\": \"${pass_phrase}\"" >> $arg_fn
+    echo "    }" >> $arg_fn
+    echo "  }," >> $arg_fn
+    echo "  \"ProgressFileName\": \"/tmp/progress.$$\"" >> $arg_fn
+    echo "}" >> $arg_fn
+    set -x
+}
+function make_restore_copy_args {
+    set +x
+    local argfn=$1
+    local incr_snap=$2
+    local ps_dir=$3
+    local dst_fn=$4
+
+    echo "{" > $argfn
+    echo "  \"SrcType\": \"Dir\"," >> $argfn
+    echo "  \"SrcArgs\": {" >> $argfn
+    echo "    \"Dir\": {" >> $argfn
+    echo "      \"Directory\": \"${ps_dir}\"," >> $argfn
+    echo "      \"Domain\": \"PS\"," >> $argfn
+    echo "      \"Base\": \"\"," >> $argfn
+    echo "      \"Incr\": \"${incr_snap}\"," >> $argfn
+    echo "      \"PassPhrase\": \"${pass_phrase}\"" >> $argfn
+    echo "    }" >> $argfn
+    echo "  }," >> $argfn
+    echo "  \"DstType\": \"File\"," >> $argfn
+    echo "  \"DstArgs\": {" >> $argfn
+
+    echo "   \"File\": {" >> $argfn
+    echo "      \"FileName\": \"$dst_fn\"" >> $argfn
+    echo "    }" >> $argfn >> $argfn
+    echo "  }," >> $argfn >> $argfn
+    echo "  \"ProgressFileName\": \"/tmp/progress.$$\"" >> $argfn
+    echo "}" >> $argfn
+    set -x
+}
+
+ARG_FN=/tmp/args.$$
+RESULT_FN=/tmp/results.$$
+PS_DIR=/tmp/myprot
+NUM_SNAPS=8
+
+mkdir -p $PS_DIR/data
+
+LUN_SIZE=$SCALE
+# Scale is Megabytes MOD_SIZE is Kilobytes
+MOD_SIZE=$SCALE
+
+tmp_lun=`mktemp /tmp/differ_test_diff_lun.XXXXXXXXXXXXXXXX`
+
+BASE_SNAP=
+for snapnum in `seq 1 $NUM_SNAPS` ; do
+
+    #write some data
+    LUN=$(fake_cluster_active_path $VOL_UUID)
+    fio --name=write --rw=randwrite --size=${LUN_SIZE}M --io_size=${MOD_SIZE}K --ioengine=libaio --iodepth=1 --bs=4K --direct=1 --numjobs=1 --filename=$LUN --randseed $RANDOM
+    sync
+
+    # Pause I/O
+    $NUVO_VM_FT_CMD -s $SOCKET pause-io -v $VOL_UUID
+
+    INCR_SNAP=$(uuidgen)
+
+    # Create a PIT
+    fake_cluster_create_pit $VOL_UUID $INCR_SNAP
+
+    #resume_io
+    $NUVO_VM_FT_CMD -s $SOCKET resume-io -v $VOL_UUID
+
+    $NUVO_VM_FT_CMD -s $SOCKET list-pits -v $VOL_UUID
+
+    #export pit
+    fake_cluster_export_pit $VOL_UUID $INCR_SNAP
+
+    PIT_LUN=$(fake_cluster_pit_path $INCR_SNAP)
+
+    make_backup_copy_args $ARG_FN $VOL_UUID $PIT_LUN "$BASE_SNAP" $INCR_SNAP $SOCKET $PS_DIR
+
+    do_copy $ARG_FN
+    rm $ARG_FN
+
+    restore_lun=`mktemp /tmp/differ_test_restore_lun.XXXXXXXXXXXXXXXX`
+    make_restore_copy_args $ARG_FN $INCR_SNAP $PS_DIR $restore_lun
+    do_copy $ARG_FN
+    rm $ARG_FN
+
+    if [ "$BASE_SNAP" != "" ] ; then
+        $NUVO_VM_FT_CMD -s $SOCKET delete-pit -v $VOL_UUID -p $BASE_SNAP
+    fi
+
+    dd if=$PIT_LUN of=$tmp_lun bs=1M count=${LUN_SIZE}
+    diff $restore_lun $tmp_lun
+
+    $NUVO_VM_FT_CMD -s $SOCKET list-pits -v $VOL_UUID
+
+    rm $restore_lun
+    rm $tmp_lun
+
+    # unexport pit
+    $NUVO_VM_FT_CMD -s $SOCKET unexport -v $VOL_UUID -p $INCR_SNAP -e $INCR_SNAP
+
+    BASE_SNAP=$INCR_SNAP
+done
+
+rm -rf $PS_DIR
+
+set +x
+echo "###################"
+echo "# Differ Test End #"
+echo "###################"
+set -x

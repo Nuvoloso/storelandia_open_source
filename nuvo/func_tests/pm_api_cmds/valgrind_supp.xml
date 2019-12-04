@@ -1,0 +1,14 @@
+{
+   <Supress_fuse_leak>
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   fun:realloc
+   fun:fuse_opt_add_arg
+   fun:add_arg
+   fun:opt_parse
+   fun:fuse_opt_parse
+   fun:parse_mount_opts
+   fun:fuse_session_new
+   fun:nuvo_fuse_spawn
+}

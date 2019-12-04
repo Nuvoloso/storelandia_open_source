@@ -1,0 +1,169 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="delete pit"
+
+if [[ "$#" -ne 6 && "$#" -ne 7 ]]; then
+    echo "$0 nuvo_vm_cmd num_devices num_parcels parcel_size percent_used percent_to_write [crash]"
+    echo "USAGE: num_devices is number of devices"
+    echo "USAGE: num_parcels is parcels per device"
+    echo "USAGE: parcel_size is in MB"
+    echo "USAGE: percent used is lun size as percentage of parcel space"
+    echo "USAGE: percent_to_write percent to of allocated size to write"
+    echo "USAGE: crash replay or not, default is no crash replay"
+    exit 1
+fi
+
+NUVO_VM=$1
+PARAM_NUM_DEVICES=$2
+PARAM_NUM_PARCELS=$3
+PARAM_PARCEL_SIZE=$4
+PARAM_PERCENT_USED=$5
+PARAM_PERCENT_TO_WRITE=$6
+crash_test="${7:-0}"
+
+size_of_parcel=$(expr $PARAM_PARCEL_SIZE \* 1024 \* 1024)
+size_of_device=$(expr $PARAM_NUM_PARCELS \* $size_of_parcel + 16 \* 1024 \* 1024)
+
+# setup the cluster
+source ./fake_cluster $NUVO_VM
+fake_cluster_create 1 $PARAM_NUM_DEVICES $size_of_device $size_of_parcel
+
+allocated_space_mb=$(expr $PARAM_NUM_DEVICES \* $PARAM_NUM_PARCELS \* $PARAM_PARCEL_SIZE)
+lun_size=$(expr $allocated_space_mb \* $PARAM_PERCENT_USED / 100 \* 1024 \* 1024 )
+
+
+#now create and use a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID $lun_size
+VOL_UUID=${VOL_UUIDS[0]}
+
+fake_cluster_grow_volume_percent $VOL_UUID 100
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+fake_cluster_log_level 1 space 50
+fake_cluster_log_level 1 lun 50
+
+# reduce the mfl threshold to trigger pause and restarts in mfl
+# this reproduces CUM 1782
+fake_cluster_debug_trigger 1  --trigger "mfl_dirty_threshold" --multi-use1 100
+
+# ----------------------------------------------------------------------
+# now I can do some test stuff
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+
+declare -a PIT_UUID
+declare -a PIT_SEEDS
+
+function create_test_pit() {
+    local pit_i=$1
+    fio --name=test --verify=crc32c --rw=randwrite --size=$lun_size --io_size=20M --ioengine=libaio --iodepth=1 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$NUVOVOL --randseed ${PIT_SEEDS[$pit_i]}
+    sync
+    PIT_UUID[$pit_i]=$( uuidgen )
+    fake_cluster_pause_io $VOL_UUID
+    fake_cluster_create_pit $VOL_UUID ${PIT_UUID[$pit_i]}
+    fake_cluster_resume_io $VOL_UUID
+}
+
+function check_test_pit() {
+    local pit_id=$1
+    local pit_uuid=${PIT_UUID[$pit_id]}
+    fake_cluster_export_pit $VOL_UUID $pit_uuid
+    local pit_name=$(fake_cluster_pit_path $pit_uuid)
+    fio --name=test --verify_only --verify=crc32c --rw=randread --size=$lun_size --io_size=20M --ioengine=libaio --iodepth=1 --bs=4K --direct=1 --numjobs=1 --unlink=0 --filename=$pit_name --randseed ${PIT_SEEDS[$pit_id]}
+    fake_cluster_unexport_pit $pit_uuid
+}
+
+# we use fixed seeds so that we can crash at a fixed offset like 1792 later to trigger panic during hole punching
+PIT_SEEDS[1]=$RANDOM
+PIT_SEEDS[2]=7965 # this will produce offset 1792 which we use to crash later, must be equal to $pit_delete_to_crash below
+PIT_SEEDS[3]=24039
+PIT_SEEDS[4]=$RANDOM
+PIT_SEEDS[5]=$RANDOM
+PIT_SEEDS[6]=$RANDOM
+
+# create pit 1,2,3,4,5
+# delete pit 1,2 and reopen volume
+# and verify pit 3,4,5
+
+create_test_pit 1
+create_test_pit 2
+# expecting mfl to get paused since we reduced the threshold above
+fake_cluster_delete_pit $VOL_UUID ${PIT_UUID[1]}
+
+# sleep before we kick mfl with a trigger cp
+sleep 5
+fake_cluster_debug_trigger 1 --trigger "cp_start" --volume $VOL_UUID
+
+create_test_pit 3
+create_test_pit 4
+create_test_pit 5
+
+if [ $crash_test -eq 0 ];  #non crash replay case
+then
+    fake_cluster_delete_pit $VOL_UUID ${PIT_UUID[2]}
+    fake_cluster_unexport_active $VOL_UUID
+    fake_cluster_close_vol $VOL_UUID
+    fake_cluster_open_vol $VOL_UUID
+    fake_cluster_export_active $VOL_UUID
+    check_test_pit 3
+    check_test_pit 4
+    check_test_pit 5
+    exit 0
+fi
+
+# crash replay code begins here
+# delete pit 3 and 2 out of order
+# and verify pit 4-5 after crash replay
+
+fake_cluster_debug_trigger 1 --trigger "cp_start" --volume $VOL_UUID
+
+# inject a fault injection for panic
+# should get triggered in the middle of delete pit
+FI_ERR_TYPE=201
+echo "Fault Injection - map panic on node NODE_UUID[$VOL_SERVER]"
+pit_to_delete_and_crash=2
+# shoot with fi
+
+# revert the mfl threshold to original, we want to crash and dont want to pause
+fake_cluster_debug_trigger 1  --trigger "mfl_dirty_threshold" --multi-use1 1024
+
+fake_cluster_debug_trigger 1 debug-trigger --trigger "map_panic" --node ${NODE_UUID[$VOL_SERVER]} \
+             --error-type ${FI_ERR_TYPE} --return-code -10 --repeat-cnt 10 --skip-cnt 0 \
+             --multi-use1 $pit_to_delete_and_crash --multi-use2 1792
+
+fake_cluster_delete_pit $VOL_UUID ${PIT_UUID[3]}
+fake_cluster_delete_pit $VOL_UUID ${PIT_UUID[$pit_to_delete_and_crash]}
+
+
+kill=false
+# reboot cluster, but don't kill as we are about to panic now
+fake_cluster_reboot_cluster $kill
+
+fake_cluster_open_vol $VOL_UUID
+fake_cluster_export_active $VOL_UUID
+
+# do things after replay
+# verify the existing pit and create and verify a new pit
+check_test_pit 4
+check_test_pit 5
+create_test_pit 6
+check_test_pit 5
+check_test_pit 4
+

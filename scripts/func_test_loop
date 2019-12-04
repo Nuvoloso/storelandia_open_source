@@ -1,0 +1,6 @@
+set -e
+set -x
+
+while (true); do
+    (cd .. ; make func_test)
+done

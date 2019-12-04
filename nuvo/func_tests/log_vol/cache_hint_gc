@@ -1,0 +1,121 @@
+#!/bin/bash
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+TEST_NAME="cache_hint_gc"
+
+# Write some data, drop cache partially, trigger gc, and verify data.
+
+source ./fake_cluster $1
+num_servers=1
+devices_per_server=1
+size_of_device=3G
+size_of_parcel=1073741824
+size_of_cache_device=1G
+num_cache_devices=1
+num_volumes=1
+
+function trigger_gc() {
+    # Trigger some arbitrary GC runs
+    for i in $(seq 1 5) ; do
+        fake_cluster_gc $VOL_UUID "fullest"
+        fake_cluster_gc $VOL_UUID "oldest"
+        fake_cluster_gc $VOL_UUID "youngest"
+    done
+}
+
+# setup the cluster
+fake_cluster_create $num_servers $devices_per_server $size_of_device $size_of_parcel
+
+# now create a volume
+ROOT_DEVICE_UUID=${DEV_UUIDS[0]}
+VOL_SERVER=${DEV_SERVER[$ROOT_DEVICE_UUID]}
+fake_cluster_create_vol $VOL_SERVER $ROOT_DEVICE_UUID 10737418240
+VOL_UUID=${VOL_UUIDS[0]}
+
+# add parcels to the volume
+fake_cluster_grow_volume_percent $VOL_UUID 100
+
+# create a cache device
+CDEV_UUID=$(uuidgen)
+
+# use cache device returns two values. The size of the device and the allocation unit size.
+out=$(fake_cluster_use_cache_device ${VOL_SERVER} $CDEV_UUID 1G | grep result | cut -d ':' -f 2 | xargs)
+size_bytes=$(echo ${out} | cut -d ' ' -f1 | xargs)
+alloc_unit_size=$(echo ${out} | cut -d ' ' -f2 | xargs)
+echo "total_cache: ${size_bytes} allocation unit: ${alloc_unit_size}"
+
+# assign cache to volume
+fake_cluster_alloc_cache_to_volume $VOL_UUID $size_bytes
+
+# export the active lun
+fake_cluster_export_active $VOL_UUID
+NUVOVOL=$(fake_cluster_active_path $VOL_UUID)
+
+# ----------------------------------------------
+# write some data
+fio --name=randwrite --rw=randwrite --size=128M --bs=16K --iodepth=1 --direct=1 --randrepeat=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL
+sync $NUVOVOL
+
+# Write more data
+rand_seed1=$RANDOM
+fio --name=randwrite --rw=randwrite --verify=crc32c --verify_fatal=1 --size=128M --bs=16K --iodepth=1 --direct=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL --randseed $rand_seed1
+sync $NUVOVOL
+
+fake_cluster_vol_manifest $VOL_UUID "what1.png"
+
+# Do some GC
+trigger_gc
+
+echo 3 > /proc/sys/vm/drop_caches
+
+# Verify data written
+fio --name=randwrite --rw=randwrite --verify_only --verify=crc32c --verify_fatal=1 --size=128M --bs=16K --iodepth=1 --direct=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL --randseed $rand_seed1
+
+# Write more data
+rand_seed2=$RANDOM
+fio --name=randwrite --rw=randwrite --verify=crc32c --verify_fatal=1 --size=128M --bs=16K --iodepth=1 --direct=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL --randseed $rand_seed2
+sync $NUVOVOL
+echo 3 > /proc/sys/vm/drop_caches
+
+# Drop Nuvo cache
+fake_cluster_debug_trigger 1 --trigger "drop_cache" --volume $VOL_UUID
+
+# Do some GC
+trigger_gc
+
+# Verify data written
+fio --name=randwrite --rw=randwrite --verify_only --verify=crc32c --verify_fatal=1 --size=128M --bs=16K --iodepth=1 --direct=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL --randseed $rand_seed2
+
+# Write more data
+rand_seed3=$RANDOM
+fio --name=randwrite --rw=randwrite --verify=crc32c --verify_fatal=1 --size=128M --bs=16K --iodepth=1 --direct=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL --randseed $rand_seed3
+sync $NUVOVOL
+
+# Do some GC
+trigger_gc
+
+# close volume
+fake_cluster_unexport_active $VOL_UUID
+fake_cluster_close_vol $VOL_UUID
+
+echo 3 > /proc/sys/vm/drop_caches
+
+# Re-open volume
+fake_cluster_open_vol $VOL_UUID
+fake_cluster_export_active $VOL_UUID
+
+# Verify data written
+fio --name=randwrite --rw=randwrite --verify_only --verify=crc32c --verify_fatal=1 --size=128M --bs=16K --iodepth=1 --direct=1 --ioengine=libaio -group_reporting --filename=$NUVOVOL --randseed $rand_seed3

@@ -1,0 +1,455 @@
+#!/bin/bash
+
+# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+echo "---------- STARTING LOG VOLUME FUNC TEST ----------"
+set -x
+set -e
+set -u
+
+# Pass in the nuvo command
+if [ "$#" -eq 0 ] ; then
+  echo "USAGE: `basename $0` <nuvo_vm location>"
+  exit 1
+fi
+NUVO_VM_FT_CMD=$1
+NUVO_TEST_ENABLE_LIST_VOL=1
+
+# Point to the NUVO_CMD in this tree.
+NUVO_CMD="../../nuvo"
+EPHEM_CMD="../../../util/nuvo_ephemeral"
+
+# Run valgrind - could be extended to other tools
+if [ $NUVO_FUNC_TEST_TOOL = "valgrind" ]; then
+    VALGRIND_CMD="valgrind --error-exitcode=1 --leak-check=full\
+            --num-callers=20 --trace-children=yes\
+            --track-origins=yes --gen-suppressions=all\
+            --suppressions=valgrind_supp.xml"
+else
+    VALGRIND_CMD=""
+fi
+
+# Create a directory
+TEST_DIR=`mktemp -d /tmp/nuvo_test.XXXXXXXXXXXXXXXX`
+echo "Created test directory $TEST_DIR"
+
+# Will identify servers with directories. Then keep the
+# key variables in associative arrays keyed by the directory
+NUVO_DIRS=( $TEST_DIR/1 $TEST_DIR/2 )
+declare -A FUSE_PID
+declare -A FUSE_DIR
+declare -A NODE_UUID
+declare -A NODE_PORT
+declare -A NODE_CTRL
+
+# Keep "devices" keyed by device UUID
+DEV_UUIDS=()
+declare -A DEV_PATH
+declare -A DEV_NODE
+declare -A DEV_SERVER
+
+# Volumes keyed by device UUID
+VOL_UUIDS=()
+VOLNO=0
+declare -A VOL_DEV_UUID
+declare -A VOL_DEV_ROOT
+declare -A VOL_LUN_NAME
+
+function finish {
+    local lc="$BASH_COMMAND" rc=$?
+    set +e
+    set +x
+    set +u
+    echo "Cleaning Up"
+    if [ ! -z "$VOL_SERVER" ]; then
+        umount $VOL_SERVER/vol
+    fi
+    for d in ${NUVO_DIRS[*]}
+    do
+        echo Tearing down nuvo: $d
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$d]} halt
+    done
+    for d in ${NUVO_DIRS[*]}
+    do
+        wait ${FUSE_PID[$d]}
+        valgrind_status=$?
+        if [ $valgrind_status -eq 0 ]; then
+            echo "valgrind and $NUVO_CMD exited cleanly"
+        else
+            if [ $rc -eq 0 ]; then
+                rc=$valgrind_status
+                lc="valgrind"
+            fi
+        fi
+    done
+    rm -rf $TEST_DIR
+    if [ $rc -eq 0 ]; then
+        echo "-----------------------------------------"
+        echo "LOG VOLUME FUNC TEST"
+        echo SUCCESS
+        echo "-----------------------------------------"
+    else
+        echo "-----------------------------------------"
+        echo "LOG VOLUME FUNC TEST"
+        echo FAILED
+        echo COMMAND [$lc]
+        echo EXITED WITH CODE [$rc]
+        echo "-----------------------------------------"
+    fi
+    exit $rc
+}
+trap finish EXIT
+
+function failed() {
+    echo "-----------------------------------------"
+    echo "DECLARING FAILURE"
+    echo "ERROR - $1"
+    echo "-----------------------------------------"
+    exit 1
+}
+
+# Launch a nuvo process
+# $1 working directory
+# This will create a mnt directory,
+# Within a directory we will build:
+#    $1/disk[123]   - virtual disks
+#    $1/fuse     - the directory luns appear in
+#    $1/nuvo_socket - the control socket
+function launch_nuvo {
+    # Create FUSE directory
+    FUSE_DIR[$1]=$1/fuse
+    mkdir -p ${FUSE_DIR[$1]}
+    NODE_CTRL[$1]=$1/nuvo_ctrl
+    NODE_UUID[$1]=$( uuidgen )
+    # Get an ephemeral port left in TIME_WAIT state soe
+    # we can pass it into the fuse process and know we
+    # are not having collisions
+    NODE_PORT[$1]=$( $EPHEM_CMD )
+
+    # Start up the volume manager
+    echo "Starting nuvo process in $1"
+
+    $VALGRIND_CMD $NUVO_CMD -f ${FUSE_DIR[$1]} socket=${NODE_CTRL[$1]}\
+        port=${NODE_PORT[$1]} >& /tmp/func_test_nuvo_output_${NODE_UUID[$1]}.txt &
+    FUSE_PID[$1]=$!
+    for i in {1..30}
+    do
+          if [ -e ${NODE_CTRL[$1]} ]; then
+              break
+          fi
+          echo "Waiting for socket"
+        sleep 2
+    done
+
+    if [ ! -e ${NODE_CTRL[$1]} ]; then
+        failed "Socket never came up"
+    fi
+
+    STATUS_UUID=$( $NUVO_VM_FT_CMD -s ${NODE_CTRL[$1]} node-status -n )
+    if [ "$STATUS_UUID" != "" ]; then
+        failed "Did not properly get empty node uuid"
+    fi
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$1]} -v use-node-uuid -u ${NODE_UUID[$1]}
+    STATUS_UUID=$( $NUVO_VM_FT_CMD -s ${NODE_CTRL[$1]} node-status -n )
+    if [ $STATUS_UUID != ${NODE_UUID[$1]} ]; then
+        failed "Did not properly set node uuid"
+    fi
+
+    # create 1GB devices on this node, format and use them.
+    declare -a dev_name=("disk1" "disk2")
+    for d in "${dev_name[@]}"
+    do
+        DEV_UUID=$( uuidgen )
+        DEV_UUIDS+=($DEV_UUID)
+        DEV_NODE[$DEV_UUID]=${NODE_UUID[$1]}
+        DEV_SERVER[$DEV_UUID]=$1
+        DEV_PATH[$DEV_UUID]=$1/$d
+        truncate -s 1G ${DEV_PATH[$DEV_UUID]}
+        echo "        Created disk" ${DEV_NODE[$DEV_UUID]} ${DEV_PATH[$DEV_UUID]}
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$1]} -v format-device -p 67108864 -d ${DEV_PATH[$DEV_UUID]} -u=$DEV_UUID
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$1]} -v use-device -d ${DEV_PATH[$DEV_UUID]} -u=$DEV_UUID
+    done
+}
+
+function nuvoapi_list_vols_test {
+
+    #set +e because we do ++ operator
+    #which may return non zero return values
+
+    set +e
+    set +u
+    set +x
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} list-vols
+    LIST_VOLS_OUT=`$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} list-vols`
+
+    VOL_UUIDS_OUTPUT=($LIST_VOLS_OUT)
+
+    declare -i volcnt
+    declare -i volout_cnt
+    volcnt=0
+    volout_cnt=0
+
+    #get number of volumes we have
+    for vol in ${VOL_UUIDS[*]}
+    do
+       volcnt+=1
+    done
+
+
+    declare -A VOL_HASH_MAP
+
+    #put the volumes we got from nuvo cmd list vols
+    #into a hashmap
+
+    for vol in ${VOL_UUIDS_OUTPUT[*]}
+    do
+        echo "list-vols insert $vol into hashmap"
+        VOL_HASH_MAP[$vol]=$vol
+        ((volout_cnt++))
+    done
+
+    declare -i mismatch
+    mismatch=0
+
+    #now lets make sure we have all the volumes
+    #from our volume list are present in the list vol output
+    #by checking the hashmap
+
+    for vol in ${VOL_UUIDS[*]}
+    do
+        echo "list-vols Look up $vol"
+        if [ ${VOL_HASH_MAP[$vol]}"X" != ${vol}"X" ]; then
+            mismatch=1
+        fi
+        echo "list-vols Trace hashmap($vol, ${VOL_HASH_MAP[$vol]})"
+    done
+
+    #if we dont find our volumes
+    # or if the volcounts dont match , declare error
+
+    if [ $mismatch -eq 1 ] || [ $volcnt -ne $volout_cnt ]
+    then
+        echo "list-vols test failed mismatch=$mismatch volcnt:$volcnt volout_cnt:$volout_cnt"
+    else
+        echo "list-vols test pass"
+    fi
+
+    set -e
+    set -u
+    set -x
+
+}
+
+# Set up basic servers
+for d in ${NUVO_DIRS[*]}
+do
+    launch_nuvo $d
+done
+
+# Now tell each server where the other is.
+for d1 in ${NUVO_DIRS[*]}
+do
+    for d2 in ${NUVO_DIRS[*]}
+    do
+        if [ $d1 != $d2 ] ; then
+            $NUVO_VM_FT_CMD -s ${NODE_CTRL[$d1]} -v node-location -n ${NODE_UUID[$d2]} -i "127.0.0.1" -p ${NODE_PORT[$d2]}
+        fi
+    done
+done
+
+# Now tell each server the location of every device.
+for d in ${NUVO_DIRS[*]}
+do
+    for dev in ${DEV_UUIDS[*]}
+    do
+        echo $d $dev
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$d]} -v device-location -d $dev -n ${DEV_NODE[$dev]}
+    done
+done
+
+# Pick on server to host all of the volumes.
+# This way we get some "local" and some "remote" root parcels
+VOL_SERVER=${DEV_SERVER[${DEV_UUIDS[0]}]}
+
+# Now create a log volume per device (i.e. each device
+# has one volume root parcel)
+for dev in ${DEV_UUIDS[*]}
+do
+    VOL_UUID=$( uuidgen )
+    ROOT_PARCEL_UUID=$( uuidgen )
+    VOL_UUIDS+=($VOL_UUID)
+    VOL_DEV_UUID[$VOL_UUID]=$dev
+    ROOT_PARCEL=$( $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} create-volume -d $dev -v $VOL_UUID -p $ROOT_PARCEL_UUID -s 1024000000)
+    LAST_CREATE_ROOT_CMD="$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} create-volume -d $dev -v $VOL_UUID -p $ROOT_PARCEL_UUID -s 1024000000"
+    if [ "$ROOT_PARCEL_UUID" != "$ROOT_PARCEL" ] ; then
+        failed "Root parcel UUID not expected"
+    fi
+    VOL_DEV_ROOT[$VOL_UUID]=$ROOT_PARCEL
+    echo Created log volume $VOL_UUID $dev $ROOT_PARCEL
+    VOL_LUN_NAME[$VOL_UUID]=$VOL_UUID
+
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} export -v $VOL_UUID -e ${VOL_LUN_NAME[$VOL_UUID]}
+    if [ ! -e ${FUSE_DIR[$VOL_SERVER]}/${VOL_LUN_NAME[$VOL_UUID]} ]; then
+        failed "volume not exported"
+    fi
+done
+
+
+#nuvo api list vols test
+#do nuvo_cmd list-vols to make sure we get our volumes back
+
+if [ $NUVO_TEST_ENABLE_LIST_VOL = "1" ]
+then
+    echo "Running list-vols nuvoapi test"
+    nuvoapi_list_vols_test
+fi
+
+# Create root parcels on servers for a device on the other servers
+
+# Attempt a duplicate root-parcel-uuid
+
+# this should fail
+if $LAST_CREATE_ROOT_CMD ; then
+        failed "Duplicate Root Parcel UUID should fail"
+fi
+
+# Each volume gets 1 parcels per device.
+for vol in ${VOL_UUIDS[*]}
+do
+    for dev in ${DEV_UUIDS[*]}
+    do
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} alloc-parcels -v $vol -d $dev -n 1
+    done
+done
+sleep 1
+# Each volume gets 2 parcels per device.
+for vol in ${VOL_UUIDS[*]}
+do
+    for dev in ${DEV_UUIDS[*]}
+    do
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} alloc-parcels -v $vol -d $dev -n 2
+    done
+done
+sleep 1
+# Each volume gets 3 parcels per device.
+for vol in ${VOL_UUIDS[*]}
+do
+    for dev in ${DEV_UUIDS[*]}
+    do
+        $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} alloc-parcels -v $vol -d $dev -n 3
+    done
+done
+
+# unexport
+for vol in ${VOL_UUIDS[*]}
+do
+    dev=${VOL_DEV_UUID[$vol]}
+    ls -l ${FUSE_DIR[$VOL_SERVER]}
+    find ${FUSE_DIR[$VOL_SERVER]}
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} unexport -v $vol -e ${VOL_LUN_NAME[$vol]}
+    if [ -e ${FUSE_DIR[$VOL_SERVER]}/${VOL_LUN_NAME[$vol]}/vol ]; then
+        failed "volume not unexported"
+    fi
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} export -v $vol -e ${VOL_LUN_NAME[$vol]}
+    if [ ! -e ${FUSE_DIR[$VOL_SERVER]}/${VOL_LUN_NAME[$vol]}/vol ]; then
+        failed "volume not exported"
+    fi
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} unexport -v $vol -e ${VOL_LUN_NAME[$vol]}
+    if [ -e ${FUSE_DIR[$VOL_SERVER]}/${VOL_LUN_NAME[$vol]}/vol ]; then
+        failed "volume not unexported"
+    fi
+done
+
+# Now lets use one of the volumes
+VOL=${VOL_UUIDS[0]}
+DEV=${VOL_DEV_UUID[$VOL]}
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} export -v $VOL -e ${VOL_LUN_NAME[$VOL]}
+LUN_PATH=${FUSE_DIR[$VOL_SERVER]}/${VOL_LUN_NAME[$VOL]}/vol
+
+###############################
+# Now on to Higher level tests
+###############################
+
+export MKE2FS_DEVICE_SECTSIZE=4096
+mkfs -t ext4 -b 4096 $LUN_PATH
+mkdir $VOL_SERVER/vol
+sudo mount $LUN_PATH $VOL_SERVER/vol
+if [ ! -d $VOL_SERVER/vol/lost+found ]; then
+    failed "No lost+found"
+fi
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} get-stats -r -d $DEV
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} get-stats -w -d $DEV
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} get-stats -w -p -d $DEV
+umount $VOL_SERVER/vol
+echo 3 > /proc/sys/vm/drop_caches
+
+sudo mount $LUN_PATH $VOL_SERVER/vol
+if [ ! -d $VOL_SERVER/vol/lost+found ]; then
+    failed "No lost+found"
+fi
+
+sync
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} manifest -v $VOL -f "manifest0.png"
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} node-status -s -v $VOL
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} node-status -u -v $VOL
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} node-status -a -v $VOL
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} node-status -t -v $VOL
+
+TOTAL_BYTES=0
+FILE_N=0
+mkdir $VOL_SERVER/dir
+ls -l $VOL_SERVER/dir
+while [ $TOTAL_BYTES -lt 6000000 ]
+do
+    FILE_SIZE=$((RANDOM * 20))
+    dd if=/dev/urandom of="$VOL_SERVER/dir/$FILE_N" bs=1 count=$FILE_SIZE
+    TOTAL_BYTES=$[$TOTAL_BYTES + $FILE_SIZE + 4096]  # Add a block to each size, pathetic excuse for rounding up.
+    FILE_N=$[$FILE_N + 1]
+done
+ls -l $VOL_SERVER/dir
+
+sudo cp -r $VOL_SERVER/dir $VOL_SERVER/vol/dir1
+$NUVO_VM_FT_CMD -v -s ${NODE_CTRL[$VOL_SERVER]} node-status -s -v $VOL
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} manifest -v $VOL -f "manifest1.png"
+sync
+
+sudo cp -r $VOL_SERVER/dir $VOL_SERVER/vol/dir2
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} node-status -s -v $VOL
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} manifest -v $VOL -f "manifest2.png"
+sync
+
+sudo cp -r $VOL_SERVER/dir $VOL_SERVER/vol/dir3
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} node-status -s -v $VOL
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} manifest -v $VOL -f "manifest3.png"
+sync
+
+sudo cp -r $VOL_SERVER/dir $VOL_SERVER/vol/dir4
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} node-status -s -v $VOL
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} manifest -v $VOL -f "manifest4.png"
+sync
+umount $VOL_SERVER/vol
+sleep 5
+
+$NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} unexport -v $VOL -e ${VOL_LUN_NAME[$VOL]}
+
+sync
+
+
+for vol in ${VOL_UUIDS[*]}
+do
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} close-volume -v $vol
+    $NUVO_VM_FT_CMD -s ${NODE_CTRL[$VOL_SERVER]} destroy-volume -v $vol -d ${VOL_DEV_UUID[$vol]} -p ${VOL_DEV_ROOT[$vol]}
+done
